@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import re
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -879,8 +881,12 @@ def main():
             if env_file.is_file() and env_file.name != ".env.acli":
                 env_mask_mounts.extend(["-v", f"/dev/null:{env_file}"])
 
+    random_hex = secrets.token_hex(4)
+    encoded_path = re.sub(r"[^a-zA-Z0-9_-]", "_", str(project_path.resolve()).replace("/", "_").lstrip("_"))
+    container_name = f"acli-{encoded_path}-{random_hex}"
+
     cmd = (
-        ["podman", "run", "-it", "--rm"]
+        ["podman", "run", "-it", "--rm", "--name", container_name, "--cap-drop=ALL", "--security-opt=no-new-privileges"]
         + volumes
         + ["-v", f"{project_dir}:{project_dir}"]
         + git_mounts

@@ -6,11 +6,36 @@
 
 ## Features
 
-- **Container Isolation**: Executes agent CLIs inside an isolated Podman container (`agcli-base`).
+- **Container Isolation**: Executes agent CLIs inside an isolated Podman container dynamically named `acli-<encoded_project_path>-<4_random_hex_bytes>` (built from `agcli-base`).
 - **Git & Hook Protection**: Prevents AI agents from tampering with `.git` history or installing malicious git hooks.
 - **Workspace Protection**: Mounts IDE configurations (`.vscode`, `.idea`) and `.envrc` as read-only.
 - **Secret Masking**: Automatically masks `.env*` files as 0-byte empty files inside the container (except `.env.acli`).
 - **Read-Only Tool Base**: Keeps global CLI configurations read-only while isolating session state per project.
+
+---
+
+## Preinstalled Environment Software
+
+The base dev environment container image (`agcli-base`) comes pre-installed with a comprehensive suite of agentic CLIs, runtimes, container engines, and dev tools:
+
+- **Agentic AI CLIs**:
+  - **Google Antigravity CLI** (`agy`)
+  - **Mistral Vibe** (`vibe`)
+  - **GitHub Copilot CLI** (`copilot`)
+  - **Continue CLI** (`cn`)
+  - **Pi CLI** (`pi`)
+- **Container Engine & Docker Tools**:
+  - **udocker** (with custom wrapper enabling rootless/unprivileged Docker container execution inside the container)
+  - Preconfigured CLI wrappers (`docker`, `docker-compose`, `podman`, `podman-compose`)
+- **Languages & Runtimes**:
+  - **Python** (managed via `uv`)
+  - **Node.js** (managed via `volta`)
+  - **Rust** & Cargo (managed via `rustup`)
+- **Build & System Utilities**:
+  - `build-essential` (C/C++ compilers, `make`)
+  - Cross-compilation toolchains (`mingw-w64`, `binutils-mingw-w64`, `musl-tools`)
+  - System CLI tools (`git`, `curl`, `wget`, `unzip`)
+  - Text editors (`nano`, `micro`)
 
 ---
 
