@@ -549,6 +549,7 @@ def main():
     parser.add_argument("--workspace-protection", action=argparse.BooleanOptionalAction, default=None, help="Protect IDE run configs and .envrc as read-only")
     parser.add_argument("--mask-env", action=argparse.BooleanOptionalAction, default=None, help="Mask .env* files as empty 0-byte files")
     parser.add_argument("--tools-ro", action=argparse.BooleanOptionalAction, default=None, help="Mount tool root directories as read-only")
+    parser.add_argument("--persistence", choices=["per-project", "global"], default=None, help="Tool state persistence mode (default: per-project)")
     parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
 
@@ -584,6 +585,13 @@ def main():
     # Resolution order: CLI Arguments > Environment Variables > Defaults
     acli_memory = args.memory or os.environ.get("ACLI_MEMORY", "16G")
     acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity")
+
+    if args.persistence is not None:
+        acli_persistence = args.persistence.strip().lower()
+    else:
+        acli_persistence = os.environ.get("ACLI_PERSISTENCE", "per-project").strip().lower()
+        if acli_persistence not in ("per-project", "global"):
+            acli_persistence = "per-project"
 
     if args.tools_ro is not None:
         acli_tools_ro = args.tools_ro
@@ -624,35 +632,135 @@ def main():
     home_path = Path.home()
     ro_suffix = ":ro" if acli_tools_ro else ""
 
+    project_slug = str(project_path.resolve()).replace("/", "_").lstrip("_")
+    proj_storage_root = home_path / ".acli" / "projects" / project_slug
+
     for tool in acli_tools_str.split(","):
         t = tool.strip()
         if t == "copilot" and (home_path / ".copilot").is_dir():
             copilot_dir = home_path / ".copilot"
             volumes.extend(["-v", f"{copilot_dir}:{copilot_dir}{ro_suffix}"])
             if acli_tools_ro:
-                for sub in ["session", "sessions", "logs", "cache", "tmp"]:
-                    s_dir = copilot_dir / sub
+                for sub in ["session", "sessions", "session-state"]:
+                    if acli_persistence == "per-project":
+                        host_s_dir = proj_storage_root / "copilot" / sub
+                    else:
+                        host_s_dir = copilot_dir / sub
+                    host_s_dir.mkdir(parents=True, exist_ok=True)
+                    volumes.extend(["-v", f"{host_s_dir}:{copilot_dir / sub}"])
+                for tmp_sub in ["log", "logs", "cache", "tmp"]:
+                    s_dir = copilot_dir / tmp_sub
                     s_dir.mkdir(parents=True, exist_ok=True)
-                    volumes.extend(["-v", f"{s_dir}:{s_dir}"])
+                    volumes.extend(["--tmpfs", str(s_dir)])
+                for f_name in ["command-history-state.json", "vscode.session.metadata.cache.json"]:
+                    if acli_persistence == "per-project":
+                        host_f = proj_storage_root / "copilot" / f_name
+                        host_f.parent.mkdir(parents=True, exist_ok=True)
+                        if not host_f.exists() and (copilot_dir / f_name).exists():
+                            try:
+                                host_f.write_bytes((copilot_dir / f_name).read_bytes())
+                            except Exception:
+                                host_f.touch(exist_ok=True)
+                        else:
+                            host_f.touch(exist_ok=True)
+                        volumes.extend(["-v", f"{host_f}:{copilot_dir / f_name}"])
+                    else:
+                        f_path = copilot_dir / f_name
+                        if f_path.exists():
+                            volumes.extend(["-v", f"{f_path}:{f_path}"])
+                db_file = copilot_dir / "session-store.db"
+                if db_file.exists() or acli_persistence == "per-project":
+                    for ext in ["", "-wal", "-shm"]:
+                        f_name = f"session-store.db{ext}"
+                        if acli_persistence == "per-project":
+                            host_f = proj_storage_root / "copilot" / f_name
+                            host_f.parent.mkdir(parents=True, exist_ok=True)
+                            if not host_f.exists() and (copilot_dir / f_name).exists():
+                                try:
+                                    host_f.write_bytes((copilot_dir / f_name).read_bytes())
+                                except Exception:
+                                    host_f.touch(exist_ok=True)
+                            else:
+                                host_f.touch(exist_ok=True)
+                            volumes.extend(["-v", f"{host_f}:{copilot_dir / f_name}"])
+                        else:
+                            f_path = copilot_dir / f_name
+                            f_path.touch(exist_ok=True)
+                            volumes.extend(["-v", f"{f_path}:{f_path}"])
         elif t == "vibe" and (home_path / ".vibe").is_dir():
             vibe_dir = home_path / ".vibe"
             volumes.extend(["-v", f"{vibe_dir}:{vibe_dir}{ro_suffix}"])
             if acli_tools_ro:
-                for sub in ["logs", "cache", "tmp", "session", "sessions"]:
-                    s_dir = vibe_dir / sub
+                for tmp_sub in ["log", "logs", "cache", "tmp", "session", "sessions"]:
+                    s_dir = vibe_dir / tmp_sub
                     s_dir.mkdir(parents=True, exist_ok=True)
-                    volumes.extend(["-v", f"{s_dir}:{s_dir}"])
+                    volumes.extend(["--tmpfs", str(s_dir)])
+                for f_name in ["vibehistory", "cache.toml", "connector_bootstrap_cache.json"]:
+                    if acli_persistence == "per-project":
+                        host_f = proj_storage_root / "vibe" / f_name
+                        host_f.parent.mkdir(parents=True, exist_ok=True)
+                        if not host_f.exists() and (vibe_dir / f_name).exists():
+                            try:
+                                host_f.write_bytes((vibe_dir / f_name).read_bytes())
+                            except Exception:
+                                host_f.touch(exist_ok=True)
+                        else:
+                            host_f.touch(exist_ok=True)
+                        volumes.extend(["-v", f"{host_f}:{vibe_dir / f_name}"])
+                    else:
+                        f_path = vibe_dir / f_name
+                        if f_path.exists():
+                            volumes.extend(["-v", f"{f_path}:{f_path}"])
         elif t == "antigravity" and (home_path / ".gemini" / "antigravity-cli").is_dir():
             ag_dir = home_path / ".gemini" / "antigravity-cli"
             volumes.extend(["-v", f"{ag_dir}:{ag_dir}{ro_suffix}"])
             if acli_tools_ro:
-                for sub in ["brain", "conversations", "logs", "cache", "state", "tmp", "sessions", "session", ".system_generated"]:
-                    s_dir = ag_dir / sub
+                for sub in ["brain", "conversations", "state", "sessions", "session", ".system_generated", "knowledge"]:
+                    if acli_persistence == "per-project":
+                        host_s_dir = proj_storage_root / "antigravity-cli" / sub
+                    else:
+                        host_s_dir = ag_dir / sub
+                    host_s_dir.mkdir(parents=True, exist_ok=True)
+                    volumes.extend(["-v", f"{host_s_dir}:{ag_dir / sub}"])
+                for tmp_sub in ["log", "logs", "cache", "tmp", "bin", "crashes", "implicit", "scratch", "updater"]:
+                    s_dir = ag_dir / tmp_sub
                     s_dir.mkdir(parents=True, exist_ok=True)
-                    volumes.extend(["-v", f"{s_dir}:{s_dir}"])
-                bin_dir = ag_dir / "bin"
-                bin_dir.mkdir(parents=True, exist_ok=True)
-                volumes.extend(["--tmpfs", str(bin_dir)])
+                    volumes.extend(["--tmpfs", str(s_dir)])
+                for f_name in ["history.jsonl", "last_check.timestamp", "cli.log", "jetski_state.pbtxt"]:
+                    if acli_persistence == "per-project":
+                        host_f = proj_storage_root / "antigravity-cli" / f_name
+                        host_f.parent.mkdir(parents=True, exist_ok=True)
+                        if not host_f.exists() and (ag_dir / f_name).exists():
+                            try:
+                                host_f.write_bytes((ag_dir / f_name).read_bytes())
+                            except Exception:
+                                host_f.touch(exist_ok=True)
+                        else:
+                            host_f.touch(exist_ok=True)
+                        volumes.extend(["-v", f"{host_f}:{ag_dir / f_name}"])
+                    else:
+                        f_path = ag_dir / f_name
+                        if f_path.exists() or f_path.is_symlink():
+                            volumes.extend(["-v", f"{f_path}:{f_path}"])
+                db_file = ag_dir / "conversation_summaries.db"
+                if db_file.exists() or acli_persistence == "per-project":
+                    for ext in ["", "-wal", "-shm"]:
+                        f_name = f"conversation_summaries.db{ext}"
+                        if acli_persistence == "per-project":
+                            host_f = proj_storage_root / "antigravity-cli" / f_name
+                            host_f.parent.mkdir(parents=True, exist_ok=True)
+                            if not host_f.exists() and (ag_dir / f_name).exists():
+                                try:
+                                    host_f.write_bytes((ag_dir / f_name).read_bytes())
+                                except Exception:
+                                    host_f.touch(exist_ok=True)
+                            else:
+                                host_f.touch(exist_ok=True)
+                            volumes.extend(["-v", f"{host_f}:{ag_dir / f_name}"])
+                        else:
+                            f_path = ag_dir / f_name
+                            f_path.touch(exist_ok=True)
+                            volumes.extend(["-v", f"{f_path}:{f_path}"])
 
     p_path = Path(project_dir)
 
