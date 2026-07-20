@@ -1,0 +1,10 @@
+[project]
+name = "acli"
+version = "0.1.0"
+description = "Podman container dev environment launcher"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+acli = "acli:main"
