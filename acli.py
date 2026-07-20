@@ -82,7 +82,69 @@ if ! udocker --version &> /dev/null ; then
 
     cat << 'UDOCKER_WRAPPER' > "$HOME/.local/bin/udocker"
 #!/bin/bash
-exec "$HOME/.local/udocker-1.3.17/udocker/udocker" --allow-root "$@"
+UDOCKER_BIN="$HOME/.local/udocker-1.3.17/udocker/udocker"
+
+if [ "$1" = "run" ]; then
+    shift
+    RUN_FLAGS=()
+    TARGET=""
+    CMD_ARGS=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)
+                RUN_FLAGS+=("$1" "$2")
+                shift 2
+                ;;
+            --name=*)
+                RUN_FLAGS+=("$1")
+                shift
+                ;;
+            -v|--volume|-e|--env|-w|--workdir|-u|--user|-p|--publish)
+                RUN_FLAGS+=("$1" "$2")
+                shift 2
+                ;;
+            -v=*|-e=*|-w=*|-u=*|-p=*)
+                RUN_FLAGS+=("$1")
+                shift
+                ;;
+            -*)
+                RUN_FLAGS+=("$1")
+                shift
+                ;;
+            *)
+                TARGET="$1"
+                shift
+                CMD_ARGS=("$@")
+                break
+                ;;
+        esac
+    done
+
+    if [ -z "$TARGET" ]; then
+        exec "$UDOCKER_BIN" --allow-root run --help
+    fi
+
+    # Check if TARGET is an existing container name or ID
+    if "$UDOCKER_BIN" --allow-root ps 2>/dev/null | grep -q -E "\b${TARGET}\b"; then
+        CID="$TARGET"
+    else
+        # Check if TARGET image is present, pull if missing
+        if ! "$UDOCKER_BIN" --allow-root images 2>/dev/null | grep -q -E "^\s*${TARGET}\b|\s*${TARGET}:"; then
+            echo "Image '${TARGET}' not found locally. Pulling via udocker..."
+            "$UDOCKER_BIN" --allow-root pull "$TARGET" || exit $?
+        fi
+        CID=$("$UDOCKER_BIN" --allow-root create "$TARGET" 2>/dev/null | tail -n1 | tr -d '\r')
+        if [ -z "$CID" ]; then
+            echo "Error: Failed to create container for '$TARGET'" >&2
+            exit 1
+        fi
+    fi
+
+    exec "$UDOCKER_BIN" --allow-root run "${RUN_FLAGS[@]}" "$CID" "${CMD_ARGS[@]}"
+else
+    exec "$UDOCKER_BIN" --allow-root "$@"
+fi
 UDOCKER_WRAPPER
 
     chmod +x "$HOME/.local/bin/udocker"
@@ -92,10 +154,124 @@ UDOCKER_WRAPPER
 
     cat << 'DOCKER_WRAPPER' > "$HOME/.local/bin/docker"
 #!/bin/bash
-echo "Warning! This is not docker, this is udocker!"
-echo "See https://indigo-dc.github.io/udocker/user_manual.html for more details"
-echo
-udocker "$@"
+if [ $# -eq 0 ]; then
+    exec udocker --help
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+    pull)
+        exec udocker pull "$@"
+        ;;
+    images)
+        exec udocker images "$@"
+        ;;
+    ps)
+        exec udocker ps "$@"
+        ;;
+    rm)
+        exec udocker rm "$@"
+        ;;
+    rmi)
+        exec udocker rmi "$@"
+        ;;
+    run)
+        RM_CONTAINER=false
+        ENV_ARGS=()
+        VOL_ARGS=()
+        WORKDIR=""
+        CONTAINER_NAME=""
+        IMAGE=""
+        COMMAND=()
+
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --rm)
+                    RM_CONTAINER=true
+                    shift
+                    ;;
+                -i|-t|-it|-ti)
+                    shift
+                    ;;
+                -e|--env)
+                    ENV_ARGS+=("-e" "$2")
+                    shift 2
+                    ;;
+                -e=*)
+                    ENV_ARGS+=("-e" "${1#*=}")
+                    shift
+                    ;;
+                -v|--volume)
+                    VOL_ARGS+=("-v" "$2")
+                    shift 2
+                    ;;
+                -v=*)
+                    VOL_ARGS+=("-v" "${1#*=}")
+                    shift
+                    ;;
+                -w|--workdir)
+                    WORKDIR="$2"
+                    shift 2
+                    ;;
+                -w=*)
+                    WORKDIR="${1#*=}"
+                    shift
+                    ;;
+                --name)
+                    CONTAINER_NAME="$2"
+                    shift 2
+                    ;;
+                --name=*)
+                    CONTAINER_NAME="${1#*=}"
+                    shift
+                    ;;
+                -*)
+                    shift
+                    ;;
+                *)
+                    IMAGE="$1"
+                    shift
+                    COMMAND=("$@")
+                    break
+                    ;;
+            esac
+        done
+
+        if [ -z "$IMAGE" ]; then
+            echo "Error: No image specified for docker run." >&2
+            exit 1
+        fi
+
+        RUN_OPTS=()
+        TMP_NAME=""
+        if [ "$RM_CONTAINER" = true ] && [ -z "$CONTAINER_NAME" ]; then
+            TMP_NAME="docker_run_tmp_$$"
+            RUN_OPTS+=("--name=$TMP_NAME")
+        elif [ -n "$CONTAINER_NAME" ]; then
+            RUN_OPTS+=("--name=$CONTAINER_NAME")
+        fi
+
+        if [ -n "$WORKDIR" ]; then
+            RUN_OPTS+=("-w" "$WORKDIR")
+        fi
+        RUN_OPTS+=("${ENV_ARGS[@]}")
+        RUN_OPTS+=("${VOL_ARGS[@]}")
+
+        udocker run "${RUN_OPTS[@]}" "$IMAGE" "${COMMAND[@]}"
+        EXIT_CODE=$?
+
+        if [ "$RM_CONTAINER" = true ] && [ -n "$TMP_NAME" ]; then
+            udocker rm "$TMP_NAME" >/dev/null 2>&1
+        fi
+
+        exit $EXIT_CODE
+        ;;
+    *)
+        exec udocker "$CMD" "$@"
+        ;;
+esac
 DOCKER_WRAPPER
 
     chmod +x "$HOME/.local/bin/docker"
@@ -216,6 +392,9 @@ def main():
                     s_dir = ag_dir / sub
                     s_dir.mkdir(parents=True, exist_ok=True)
                     volumes.extend(["-v", f"{s_dir}:{s_dir}"])
+                bin_dir = ag_dir / "bin"
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                volumes.extend(["--tmpfs", str(bin_dir)])
 
     p_path = Path(project_dir)
 
