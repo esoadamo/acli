@@ -162,6 +162,9 @@ CMD="$1"
 shift
 
 case "$CMD" in
+    compose)
+        exec docker-compose "$@"
+        ;;
     pull)
         exec udocker pull "$@"
         ;;
@@ -274,7 +277,262 @@ case "$CMD" in
 esac
 DOCKER_WRAPPER
 
-    chmod +x "$HOME/.local/bin/docker"
+    cat << 'COMPOSE_WRAPPER' > "$HOME/.local/bin/docker-compose"
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+def parse_simple_yaml(text):
+    services = {}
+    current_service = None
+    current_key = None
+
+    lines = text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        if stripped == "services:":
+            continue
+
+        if indent == 2 and line.strip().endswith(":"):
+            current_service = line.strip()[:-1]
+            services[current_service] = {}
+            current_key = None
+            continue
+
+        if current_service and indent == 4:
+            if ":" in stripped:
+                k, v = stripped.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if not v:
+                    current_key = k
+                    services[current_service][k] = []
+                else:
+                    v = v.strip("\"'")
+                    services[current_service][k] = v
+                    current_key = None
+            continue
+
+        if current_service and current_key and indent >= 6:
+            item = stripped.lstrip("- ").strip("\"'")
+            if isinstance(services[current_service].get(current_key), list):
+                services[current_service][current_key].append(item)
+
+    return {"services": services}
+
+
+def load_compose_file(filepath=None):
+    if filepath:
+        paths = [Path(filepath)]
+    else:
+        paths = [
+            Path("docker-compose.yml"),
+            Path("docker-compose.yaml"),
+            Path("compose.yml"),
+            Path("compose.yaml"),
+        ]
+
+    chosen = None
+    for p in paths:
+        if p.is_file():
+            chosen = p
+            break
+
+    if not chosen:
+        print("Error: No docker-compose.yml or compose.yml file found.", file=sys.stderr)
+        sys.exit(1)
+
+    content = chosen.read_text(encoding="utf-8")
+    if yaml is not None:
+        try:
+            data = yaml.safe_load(content)
+            if data and "services" in data:
+                return data, chosen
+        except Exception:
+            pass
+
+    return parse_simple_yaml(content), chosen
+
+
+def find_udocker_bin():
+    home = Path.home()
+    local_udocker = home / ".local" / "bin" / "udocker"
+    if local_udocker.is_file() and os.access(local_udocker, os.X_OK):
+        return str(local_udocker)
+    return "udocker"
+
+
+def get_pid_file(project_name, service_name):
+    tmp_dir = Path("/tmp") / ".docker_compose_pids"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir / f"{project_name}_{service_name}.pid"
+
+
+def cmd_up(compose_data, compose_file, detached=False):
+    project_name = compose_file.parent.resolve().name.lower()
+    project_name = re.sub(r"[^a-z0-9_-]", "", project_name) or "compose"
+    udocker_bin = find_udocker_bin()
+
+    services = compose_data.get("services", {})
+    if not services:
+        print("No services found in compose file.", file=sys.stderr)
+        return
+
+    for service_name, config in services.items():
+        if not isinstance(config, dict):
+            continue
+
+        image = config.get("image")
+        if not image:
+            print(f"Error: Service '{service_name}' has no 'image' specified.", file=sys.stderr)
+            continue
+
+        container_name = config.get("container_name") or f"{project_name}_{service_name}_1"
+
+        subprocess.run([udocker_bin, "rm", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        run_args = [udocker_bin, "run"]
+        run_args.extend(["--name", container_name])
+
+        volumes = config.get("volumes", [])
+        if isinstance(volumes, list):
+            for v in volumes:
+                run_args.extend(["-v", str(v)])
+
+        env = config.get("environment", [])
+        if isinstance(env, list):
+            for e in env:
+                run_args.extend(["-e", str(e)])
+        elif isinstance(env, dict):
+            for k, v in env.items():
+                run_args.extend(["-e", f"{k}={v}"])
+
+        cmd = config.get("command")
+        cmd_list = []
+        if isinstance(cmd, str):
+            if cmd.startswith("[") and cmd.endswith("]"):
+                try:
+                    cmd_list = ast.literal_eval(cmd)
+                except Exception:
+                    cmd_list = [x.strip("\"' ") for x in cmd[1:-1].split(",")]
+            else:
+                cmd_list = cmd.split()
+        elif isinstance(cmd, list):
+            cmd_list = [str(x) for x in cmd]
+
+        full_cmd = run_args + [image] + cmd_list
+
+        print(f"Starting {container_name} ({image})...")
+
+        if detached:
+            pid_file = get_pid_file(project_name, service_name)
+            proc = subprocess.Popen(
+                full_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            pid_file.write_text(str(proc.pid))
+            print(f"Started {container_name} in background (PID {proc.pid})")
+        else:
+            try:
+                subprocess.run(full_cmd)
+            except KeyboardInterrupt:
+                print(f"\nStopping {container_name}...")
+                cmd_down(compose_data, compose_file)
+                break
+
+
+def cmd_down(compose_data, compose_file):
+    project_name = compose_file.parent.resolve().name.lower()
+    project_name = re.sub(r"[^a-z0-9_-]", "", project_name) or "compose"
+    udocker_bin = find_udocker_bin()
+
+    services = compose_data.get("services", {})
+    for service_name, config in services.items():
+        if not isinstance(config, dict):
+            continue
+
+        container_name = config.get("container_name") or f"{project_name}_{service_name}_1"
+
+        pid_file = get_pid_file(project_name, service_name)
+        if pid_file.is_file():
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+                print(f"Stopped background process PID {pid} for {container_name}")
+            except Exception:
+                pass
+            try:
+                pid_file.unlink()
+            except Exception:
+                pass
+
+        print(f"Removing container {container_name}...")
+        subprocess.run([udocker_bin, "rm", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="docker-compose wrapper for udocker")
+    parser.add_argument("-f", "--file", help="Path to compose file")
+    subparsers = parser.add_subparsers(dest="subcommand")
+
+    up_parser = subparsers.add_parser("up", help="Build, (re)create, start, and attach to containers for a service")
+    up_parser.add_argument("-d", "--detach", action="store_true", help="Detached mode: Run containers in the background")
+
+    down_parser = subparsers.add_parser("down", help="Stop and remove containers, networks, images, and volumes")
+
+    ps_parser = subparsers.add_parser("ps", help="List containers")
+
+    args, extra = parser.parse_known_args()
+
+    compose_data, compose_file = load_compose_file(args.file)
+
+    if args.subcommand == "up":
+        cmd_up(compose_data, compose_file, detached=args.detach)
+    elif args.subcommand == "down":
+        cmd_down(compose_data, compose_file)
+    elif args.subcommand == "ps":
+        udocker_bin = find_udocker_bin()
+        subprocess.run([udocker_bin, "ps"])
+    else:
+        if not args.subcommand:
+            parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+COMPOSE_WRAPPER
+
+    cat << 'PODMAN_WRAPPER' > "$HOME/.local/bin/podman"
+#!/bin/bash
+exec docker "$@"
+PODMAN_WRAPPER
+
+    cat << 'PODMAN_COMPOSE_WRAPPER' > "$HOME/.local/bin/podman-compose"
+#!/bin/bash
+exec docker-compose "$@"
+PODMAN_COMPOSE_WRAPPER
+
+    chmod +x "$HOME/.local/bin/docker" "$HOME/.local/bin/docker-compose" "$HOME/.local/bin/podman" "$HOME/.local/bin/podman-compose"
+
+    echo 'alias podman="docker"' >> "$HOME/.bashrc"
+    echo 'alias podman-compose="docker-compose"' >> "$HOME/.bashrc"
 
     export UDOCKER_TARBALL=/tmp/udocker-englib-1.2.11.tar.gz
     udocker install
