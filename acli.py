@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import fnmatch
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -543,11 +545,171 @@ rm -rv /tmp/*
 """
 
 
+def copy_with_cow_rsync_fallback(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Try Copy-On-Write (reflink) first
+    try:
+        res = subprocess.run(
+            ["cp", "--reflink=always", "-a", str(src), str(dst)],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            return
+    except Exception:
+        pass
+
+    # 2. Try rsync (skips unmodified files)
+    try:
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+            rsync_src = str(src) + "/"
+            rsync_dst = str(dst) + "/"
+        else:
+            rsync_src = str(src)
+            rsync_dst = str(dst)
+
+        res = subprocess.run(
+            ["rsync", "-a", rsync_src, rsync_dst],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0:
+            return
+    except Exception:
+        pass
+
+    # 3. Fallback to classical copy
+    if not dst.exists():
+        if src.is_dir():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+    else:
+        if src.is_dir():
+            for root, _, files in os.walk(src):
+                rel = Path(root).relative_to(src)
+                target_dir = dst / rel
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for f in files:
+                    s_file = Path(root) / f
+                    d_file = target_dir / f
+                    if not d_file.exists() or s_file.stat().st_mtime > d_file.stat().st_mtime:
+                        shutil.copy2(s_file, d_file)
+        else:
+            if not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime:
+                shutil.copy2(src, dst)
+
+
+def get_ignored_paths(p_path: Path) -> list[Path]:
+    gitignore_files = list(p_path.rglob(".gitignore"))
+    if not gitignore_files:
+        return []
+
+    ignored_rel_paths = set()
+
+    # Try git command first if available and inside git work tree
+    try:
+        res = subprocess.run(
+            ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"],
+            cwd=str(p_path),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip().rstrip("/")
+                if line:
+                    ignored_rel_paths.add(Path(line))
+    except Exception:
+        pass
+
+    # Fallback/supplemental pattern matching from .gitignore files
+    if not ignored_rel_paths:
+        for gi_file in gitignore_files:
+            gi_dir = gi_file.parent
+            try:
+                content = gi_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            patterns = []
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                patterns.append(line)
+
+            if not patterns:
+                continue
+
+            for item in gi_dir.rglob("*"):
+                if ".git" in item.parts or "git" in item.parts:
+                    continue
+                try:
+                    rel_to_gi = item.relative_to(gi_dir)
+                    rel_to_proj = item.relative_to(p_path)
+                except ValueError:
+                    continue
+
+                is_dir = item.is_dir()
+                matched = False
+                for pat in patterns:
+                    negated = False
+                    if pat.startswith("!"):
+                        negated = True
+                        pat = pat[1:]
+
+                    dir_only = pat.endswith("/")
+                    if dir_only:
+                        pat = pat.rstrip("/")
+                        if not is_dir:
+                            continue
+
+                    target_str = str(rel_to_gi)
+                    if "/" not in pat:
+                        if fnmatch.fnmatch(item.name, pat) or fnmatch.fnmatch(target_str, pat):
+                            matched = not negated
+                    else:
+                        pat = pat.lstrip("/")
+                        if fnmatch.fnmatch(target_str, pat) or fnmatch.fnmatch(target_str, pat + "/*"):
+                            matched = not negated
+
+                if matched:
+                    ignored_rel_paths.add(rel_to_proj)
+
+    # Filter out forbidden paths (.git folder, non-existent paths)
+    valid_paths = set()
+    for rel_p in ignored_rel_paths:
+        if ".git" in rel_p.parts or "git" in rel_p.parts:
+            continue
+        abs_p = p_path / rel_p
+        if not abs_p.exists():
+            continue
+        valid_paths.add(rel_p)
+
+    # Prune redundant child paths whose parent is already included
+    pruned_paths = []
+    for rel_p in sorted(valid_paths):
+        has_parent_in_valid = False
+        for parent in rel_p.parents:
+            if parent != Path(".") and parent in valid_paths:
+                has_parent_in_valid = True
+                break
+        if not has_parent_in_valid:
+            pruned_paths.append(rel_p)
+
+    return pruned_paths
+
+
 def main():
     parser = argparse.ArgumentParser(description="acli - Podman container dev environment launcher")
     parser.add_argument("project_dir", help="Path to project directory")
     parser.add_argument("--git-mode", choices=["ro", "tmpfs", "rw"], default=None, help="Git protection mode (default: ro)")
     parser.add_argument("--git-hooks-mode", choices=["ro", "tmpfs", "rw"], default=None, help="Git hooks protection mode (default: tmpfs if git-mode is rw, otherwise ro)")
+    parser.add_argument("--gitignore-mode", choices=["mask", "ro", "rw"], default=None, help="Gitignore protection mode (default: mask)")
     parser.add_argument("--workspace-protection", action=argparse.BooleanOptionalAction, default=None, help="Protect IDE run configs and .envrc as read-only")
     parser.add_argument("--mask-env", action=argparse.BooleanOptionalAction, default=None, help="Mask .env* files as empty 0-byte files")
     parser.add_argument("--tools-ro", action=argparse.BooleanOptionalAction, default=None, help="Mount tool root directories as read-only")
@@ -619,6 +781,13 @@ def main():
         git_hooks_mode = os.environ.get("ACLI_GIT_HOOKS_MODE", "").strip().lower()
         if not git_hooks_mode:
             git_hooks_mode = "ro" if git_mode == "ro" else "tmpfs"
+
+    if args.gitignore_mode is not None:
+        gitignore_mode = args.gitignore_mode.strip().lower()
+    else:
+        gitignore_mode = os.environ.get("ACLI_GITIGNORE_MODE", "mask").strip().lower()
+        if gitignore_mode not in ("mask", "ro", "rw"):
+            gitignore_mode = "mask"
 
     if args.workspace_protection is not None:
         workspace_protection = args.workspace_protection
@@ -860,6 +1029,22 @@ def main():
             if u_cfg.is_file():
                 git_mounts.extend(["-v", f"{u_cfg}:{u_cfg}:ro"])
 
+    # Gitignore protection logic based on gitignore_mode
+    gitignore_mounts = []
+    if gitignore_mode == "mask":
+        masked_root = proj_storage_root / "gitignore_masked"
+        ignored_paths = get_ignored_paths(p_path)
+        for rel_path in ignored_paths:
+            abs_host_path = p_path / rel_path
+            target_in_storage = masked_root / rel_path
+            copy_with_cow_rsync_fallback(abs_host_path, target_in_storage)
+            gitignore_mounts.extend(["-v", f"{target_in_storage}:{abs_host_path}"])
+    elif gitignore_mode == "ro":
+        ignored_paths = get_ignored_paths(p_path)
+        for rel_path in ignored_paths:
+            abs_host_path = p_path / rel_path
+            gitignore_mounts.extend(["-v", f"{abs_host_path}:{abs_host_path}:ro"])
+
     # Workspace persistence protection: mount IDE run configs & direnv as read-only
     workspace_ro_mounts = []
     if workspace_protection:
@@ -890,6 +1075,7 @@ def main():
         + volumes
         + ["-v", f"{project_dir}:{project_dir}"]
         + git_mounts
+        + gitignore_mounts
         + workspace_ro_mounts
         + env_mask_mounts
         + ["--workdir", project_dir, "--memory", acli_memory, "agcli-base", "bash"]

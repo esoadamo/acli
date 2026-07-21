@@ -72,6 +72,7 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
 | `project_dir` | N/A | Path to the target project directory to mount | *(Required)* | Any valid directory path |
 | `--git-mode` | `ACLI_GIT_MODE` / `ACLI_GIT_PROTECTION` | Git repository protection mode | `ro` | `ro`, `tmpfs`, `rw` |
 | `--git-hooks-mode` | `ACLI_GIT_HOOKS_MODE` | Protection mode for `.git/hooks` | `ro` (or `tmpfs` if `git-mode=rw`) | `ro`, `tmpfs`, `rw` |
+| `--gitignore-mode` | `ACLI_GITIGNORE_MODE` | Protection for `.gitignore` matching files/folders (copies COW to per-project and mounts) | `mask` | `mask`, `ro`, `rw` |
 | `--workspace-protection` / `--no-workspace-protection` | `ACLI_WORKSPACE_PROTECTION` | Protect IDE run configs (`.vscode`, `.idea`) & `.envrc` as read-only | `true` (`--workspace-protection`) | `true`, `false` |
 | `--mask-env` / `--no-mask-env` | `ACLI_MASK_ENV` | Mask `.env*` files as 0-byte empty files | `true` (`--mask-env`) | `true`, `false` |
 | `--tools-ro` / `--no-tools-ro` | `ACLI_TOOLS_RO` | Mount tool configuration root directories as read-only | `true` (`--tools-ro`) | `true`, `false` |
@@ -93,7 +94,13 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
   uv run acli . --git-mode rw --git-hooks-mode tmpfs
   ```
 
+- **Running with Gitignore Read-Only Protection:**
+  ```bash
+  uv run acli . --gitignore-mode ro
+  ```
+
 - **Running with specific tools & reduced memory:**
   ```bash
   uv run acli . --tools vibe,antigravity --memory 8G
   ```
+
