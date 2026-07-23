@@ -388,6 +388,14 @@ class TestMainFunction(unittest.TestCase):
         target_log.touch()
         symlink_file.symlink_to(target_log)
 
+        claude_dir = fake_home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "history.jsonl").write_text("{}")
+        (claude_dir / "settings.json").write_text("{}")
+        (claude_dir / ".credentials.json").write_text('{"token": "test"}')
+        claude_json = fake_home / ".claude.json"
+        claude_json.write_text('{"oauth": "token"}')
+
         (self.p_path / ".gitignore").write_text("ignored.txt\n")
         (self.p_path / "ignored.txt").touch()
 
@@ -443,6 +451,14 @@ class TestMainFunction(unittest.TestCase):
         (self.p_path / ".env").touch()
         (self.p_path / ".env.local").touch()
         (self.p_path / ".env.acli").touch()
+
+        # Pre-create per-project claude storage so the "already exists" branches are covered
+        project_slug = str(self.p_path.resolve()).replace("/", "_").lstrip("_")
+        claude_proj_storage = fake_home / ".acli" / "projects" / project_slug / "claude"
+        claude_proj_config = claude_proj_storage / "config"
+        claude_proj_config.mkdir(parents=True, exist_ok=True)
+        (claude_proj_config / "settings.json").write_text("{}")
+        (claude_proj_storage / ".claude.json").write_text('{"oauth": "cached"}')
 
         # Test case 1: git-mode=ro, git-hooks-mode=tmpfs, persistence=per-project, tools-ro=true
         with patch("pathlib.Path.home", return_value=fake_home):
@@ -508,9 +524,15 @@ class TestMainFunction(unittest.TestCase):
         (ag_dir / "history.jsonl").write_text("{}")
         (ag_dir / "conversation_summaries.db").touch()
 
+        claude_dir = fake_home / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "history.jsonl").write_text("{}")
+        claude_json = fake_home / ".claude.json"
+        claude_json.write_text('{"oauth": "token"}')
+
         env_override = {
             "ACLI_MEMORY": "32G",
-            "ACLI_TOOLS": "copilot,vibe,antigravity",
+            "ACLI_TOOLS": "copilot,vibe,antigravity,claude",
             "ACLI_PERSISTENCE": "invalid_persistence_value",
             "ACLI_TOOLS_RO": "1",
             "ACLI_GIT_MODE": "",

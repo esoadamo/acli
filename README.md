@@ -1,6 +1,6 @@
 # acli
 
-`acli` is a secure container wrapper around agentic CLIs (such as GitHub Copilot CLI, Mistral Vibe, and Google Antigravity). It launches agentic tasks inside an isolated Podman dev environment to prevent agents from breaking out ("escaping from jail"), overwriting critical host files, or reading sensitive environment secrets.
+`acli` is a secure container wrapper around agentic CLIs (such as GitHub Copilot CLI, Mistral Vibe, Google Antigravity, and Anthropic Claude Code). It launches agentic tasks inside an isolated Podman dev environment to prevent agents from breaking out ("escaping from jail"), overwriting critical host files, or reading sensitive environment secrets.
 
 ---
 
@@ -8,6 +8,7 @@
 
 - **Container Isolation**: Executes agent CLIs inside an isolated Podman container dynamically named `acli-<encoded_project_path>-<4_random_hex_bytes>` (built from `agcli-base`).
 - **Git & Hook Protection**: Prevents AI agents from tampering with `.git` history or installing malicious git hooks.
+- **Gitignore Protection**: Copies gitignored files/directories (build artifacts, caches, `.venv`) into per-project storage and mounts them in place of the originals, preventing agents from modifying host-side generated files.
 - **Workspace Protection**: Mounts IDE configurations (`.vscode`, `.idea`) and `.envrc` as read-only.
 - **Secret Masking**: Automatically masks `.env*` files as 0-byte empty files inside the container (except `.env.acli`).
 - **Read-Only Tool Base**: Keeps global CLI configurations read-only while isolating session state per project.
@@ -22,6 +23,7 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
   - **Google Antigravity CLI** (`agy`)
   - **Mistral Vibe** (`vibe`)
   - **GitHub Copilot CLI** (`copilot`)
+  - **Anthropic Claude Code** (`claude`)
   - **Continue CLI** (`cn`)
   - **Pi CLI** (`pi`)
 - **Container Engine & Docker Tools**:
@@ -72,13 +74,23 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
 | `project_dir` | N/A | Path to the target project directory to mount | *(Required)* | Any valid directory path |
 | `--git-mode` | `ACLI_GIT_MODE` / `ACLI_GIT_PROTECTION` | Git repository protection mode | `ro` | `ro`, `tmpfs`, `rw` |
 | `--git-hooks-mode` | `ACLI_GIT_HOOKS_MODE` | Protection mode for `.git/hooks` | `ro` (or `tmpfs` if `git-mode=rw`) | `ro`, `tmpfs`, `rw` |
-| `--gitignore-mode` | `ACLI_GITIGNORE_MODE` | Protection for `.gitignore` matching files/folders (copies COW to per-project and mounts) | `mask` | `mask`, `ro`, `rw` |
+| `--gitignore-mode` | `ACLI_GITIGNORE_MODE` | Protection mode for files/directories matched by `.gitignore` | `mask` | `mask`, `ro`, `rw` |
 | `--workspace-protection` / `--no-workspace-protection` | `ACLI_WORKSPACE_PROTECTION` | Protect IDE run configs (`.vscode`, `.idea`) & `.envrc` as read-only | `true` (`--workspace-protection`) | `true`, `false` |
 | `--mask-env` / `--no-mask-env` | `ACLI_MASK_ENV` | Mask `.env*` files as 0-byte empty files | `true` (`--mask-env`) | `true`, `false` |
 | `--tools-ro` / `--no-tools-ro` | `ACLI_TOOLS_RO` | Mount tool configuration root directories as read-only | `true` (`--tools-ro`) | `true`, `false` |
 | `--persistence` | `ACLI_PERSISTENCE` | Session state and persistence storage scoping | `per-project` | `per-project`, `global` |
-| `--tools` | `ACLI_TOOLS` | Comma-separated agent CLI tool profiles to mount | `copilot,vibe,antigravity` | Any combination of `copilot`, `vibe`, `antigravity` |
+| `--tools` | `ACLI_TOOLS` | Comma-separated agent CLI tool profiles to mount | `copilot,vibe,antigravity,claude` | Any combination of `copilot`, `vibe`, `antigravity`, `claude` |
 | `--memory` | `ACLI_MEMORY` | Container memory limit | `16G` | E.g., `4G`, `8G`, `16G`, `32G` |
+
+### Gitignore Modes
+
+The `--gitignore-mode` option controls how files and directories matched by `.gitignore` are handled inside the container:
+
+| Mode | Behavior |
+| :--- | :--- |
+| `mask` *(default)* | Copies gitignored files/directories into per-project storage (`~/.acli/projects/<slug>/gitignore_masked/`) using Copy-On-Write (with rsync/cp fallback) and mounts them in place of the originals. The agent can freely modify these copies without affecting your host files. |
+| `ro` | Mounts gitignored files/directories as **read-only** inside the container. The agent can see them but cannot modify them. |
+| `rw` | No protection — gitignored files are accessible read-write through the normal project directory mount. |
 
 ---
 
@@ -99,8 +111,12 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
   uv run acli . --gitignore-mode ro
   ```
 
-- **Running with specific tools & reduced memory:**
+- **Running with No Gitignore Protection (full read-write):**
   ```bash
-  uv run acli . --tools vibe,antigravity --memory 8G
+  uv run acli . --gitignore-mode rw
   ```
 
+- **Running with specific tools & reduced memory:**
+  ```bash
+  uv run acli . --tools vibe,antigravity,claude --memory 8G
+  ```

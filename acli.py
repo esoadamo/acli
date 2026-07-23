@@ -76,6 +76,11 @@ if ! pi --version &> /dev/null; then
     curl -fsSL https://pi.dev/install.sh | sh
 fi
 
+if ! claude --version &> /dev/null; then
+    curl -fsSL https://claude.ai/install.sh | bash
+    echo 'alias claude="IS_SANDBOX=1 claude --dangerously-skip-permissions"' >> "$HOME/.bashrc"
+fi
+
 if ! udocker --version &> /dev/null ; then
     curl -L https://github.com/indigo-dc/udocker/releases/download/1.3.17/udocker-1.3.17.tar.gz > /tmp/udocker-1.3.17.tar.gz
     curl -L https://github.com/jorge-lip/udocker-builds/raw/master/tarballs/udocker-englib-1.2.11.tar.gz > /tmp/udocker-englib-1.2.11.tar.gz
@@ -714,7 +719,7 @@ def main():
     parser.add_argument("--mask-env", action=argparse.BooleanOptionalAction, default=None, help="Mask .env* files as empty 0-byte files")
     parser.add_argument("--tools-ro", action=argparse.BooleanOptionalAction, default=None, help="Mount tool root directories as read-only")
     parser.add_argument("--persistence", choices=["per-project", "global"], default=None, help="Tool state persistence mode (default: per-project)")
-    parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity)")
+    parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
 
     args = parser.parse_args()
@@ -748,7 +753,7 @@ def main():
 
     # Resolution order: CLI Arguments > Environment Variables > Defaults
     acli_memory = args.memory or os.environ.get("ACLI_MEMORY", "16G")
-    acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity")
+    acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity,claude")
 
     if args.persistence is not None:
         acli_persistence = args.persistence.strip().lower()
@@ -932,6 +937,29 @@ def main():
                             f_path = ag_dir / f_name
                             f_path.touch(exist_ok=True)
                             volumes.extend(["-v", f"{f_path}:{f_path}"])
+        elif t == "claude" and (home_path / ".claude").is_dir():
+            claude_dir = home_path / ".claude"
+            if acli_tools_ro and acli_persistence == "per-project":
+                claude_storage = proj_storage_root / "claude" / "config"
+                copy_with_cow_rsync_fallback(claude_dir, claude_storage)
+                volumes.extend(["-v", f"{claude_storage}:{claude_dir}"])
+            else:
+                volumes.extend(["-v", f"{claude_dir}:{claude_dir}"])
+            claude_json = home_path / ".claude.json"
+            if claude_json.is_file():
+                if acli_persistence == "per-project":
+                    host_claude_json = proj_storage_root / "claude" / ".claude.json"
+                    host_claude_json.parent.mkdir(parents=True, exist_ok=True)
+                    if not host_claude_json.exists():
+                        try:
+                            host_claude_json.write_bytes(claude_json.read_bytes())
+                        except Exception:
+                            host_claude_json.touch(exist_ok=True)
+                    volumes.extend(["-v", f"{host_claude_json}:{claude_json}"])
+                else:
+                    volumes.extend(["-v", f"{claude_json}:{claude_json}"])
+            volumes.extend(["-e", "DISABLE_AUTOUPDATER=1"])
+            volumes.extend(["-e", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"])
 
     p_path = Path(project_dir)
 
@@ -1070,8 +1098,14 @@ def main():
     encoded_path = re.sub(r"[^a-zA-Z0-9_-]", "_", str(project_path.resolve()).replace("/", "_").lstrip("_"))
     container_name = f"acli-{encoded_path}-{random_hex}"
 
+    userns_opts = []
+    if hasattr(os, "getuid") and os.getuid() != 0:
+        userns_opts = ["--userns=keep-id:uid=0,gid=0"]
+
     cmd = (
-        ["podman", "run", "-it", "--rm", "--name", container_name, "--cap-drop=ALL", "--security-opt=no-new-privileges"]
+        ["podman", "run", "-it", "--rm", "--name", container_name]
+        + userns_opts
+        + ["--cap-drop=ALL", "--security-opt=no-new-privileges"]
         + volumes
         + ["-v", f"{project_dir}:{project_dir}"]
         + git_mounts
