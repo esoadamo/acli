@@ -709,6 +709,52 @@ def get_ignored_paths(p_path: Path) -> list[Path]:
     return pruned_paths
 
 
+def check_userns_supported(userns_option: str) -> bool:
+    try:
+        # Run a quick check using podman run with the specified userns option.
+        # Since 'agcli-base' is guaranteed to exist at this point in the main execution flow,
+        # we can use it to perform a quick, no-op run.
+        res = subprocess.run(
+            ["podman", "run", "--rm", f"--userns={userns_option}", "agcli-base", "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def filter_mounts(mount_args: list[str], mounted_destinations: set[str]) -> list[str]:
+    filtered = []
+    i = 0
+    while i < len(mount_args):
+        if i + 1 >= len(mount_args):
+            filtered.append(mount_args[i])
+            break
+
+        opt = mount_args[i]
+        val = mount_args[i+1]
+
+        dest = None
+        if opt == "-v":
+            parts = val.split(":")
+            if len(parts) >= 2:
+                dest = parts[1]
+        elif opt == "--tmpfs":
+            dest = val
+
+        if dest:
+            dest_path = str(Path(dest).resolve())
+            if dest_path in mounted_destinations:
+                i += 2
+                continue
+            mounted_destinations.add(dest_path)
+
+        filtered.extend([opt, val])
+        i += 2
+    return filtered
+
+
 def main():
     parser = argparse.ArgumentParser(description="acli - Podman container dev environment launcher")
     parser.add_argument("project_dir", help="Path to project directory")
@@ -721,6 +767,7 @@ def main():
     parser.add_argument("--persistence", choices=["per-project", "global"], default=None, help="Tool state persistence mode (default: per-project)")
     parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
+    parser.add_argument("--userns", default=None, help="User namespace mode for Podman (e.g. keep-id:uid=0,gid=0, none)")
 
     args = parser.parse_args()
 
@@ -803,6 +850,13 @@ def main():
         mask_env_files = args.mask_env
     else:
         mask_env_files = os.environ.get("ACLI_MASK_ENV", "true").strip().lower() not in ("0", "false", "no", "off")
+
+    if args.userns is not None:
+        acli_userns = args.userns.strip().lower()
+    else:
+        acli_userns = os.environ.get("ACLI_USERNS", "auto").strip().lower()
+        if not acli_userns:
+            acli_userns = "auto"
 
     volumes = []
     home_path = Path.home()
@@ -1099,19 +1153,31 @@ def main():
     container_name = f"acli-{encoded_path}-{random_hex}"
 
     userns_opts = []
-    if hasattr(os, "getuid") and os.getuid() != 0:
-        userns_opts = ["--userns=keep-id:uid=0,gid=0"]
+    if acli_userns == "auto":
+        if hasattr(os, "getuid") and os.getuid() != 0:
+            if check_userns_supported("keep-id:uid=0,gid=0"):
+                userns_opts = ["--userns=keep-id:uid=0,gid=0"]
+    elif acli_userns and acli_userns not in ("none", "off", "false"):
+        userns_opts = [f"--userns={acli_userns}"]
+
+    mounted_destinations = set()
+    filtered_volumes = filter_mounts(volumes, mounted_destinations)
+    filtered_project_mount = filter_mounts(["-v", f"{project_dir}:{project_dir}"], mounted_destinations)
+    filtered_git_mounts = filter_mounts(git_mounts, mounted_destinations)
+    filtered_env_mask_mounts = filter_mounts(env_mask_mounts, mounted_destinations)
+    filtered_gitignore_mounts = filter_mounts(gitignore_mounts, mounted_destinations)
+    filtered_workspace_ro_mounts = filter_mounts(workspace_ro_mounts, mounted_destinations)
 
     cmd = (
         ["podman", "run", "-it", "--rm", "--name", container_name]
         + userns_opts
         + ["--cap-drop=ALL", "--security-opt=no-new-privileges"]
-        + volumes
-        + ["-v", f"{project_dir}:{project_dir}"]
-        + git_mounts
-        + gitignore_mounts
-        + workspace_ro_mounts
-        + env_mask_mounts
+        + filtered_volumes
+        + filtered_project_mount
+        + filtered_git_mounts
+        + filtered_gitignore_mounts
+        + filtered_workspace_ro_mounts
+        + filtered_env_mask_mounts
         + ["--workdir", project_dir, "--memory", acli_memory, "agcli-base", "bash"]
     )
 

@@ -304,8 +304,11 @@ class TestMainFunction(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.p_path = Path(self.test_dir)
+        self.userns_patcher = patch("acli.check_userns_supported", return_value=True)
+        self.mock_userns_supported = self.userns_patcher.start()
 
     def tearDown(self):
+        self.userns_patcher.stop()
         for root, dirs, files in os.walk(self.test_dir):
             for d in dirs:
                 os.chmod(os.path.join(root, d), 0o777)
@@ -352,10 +355,14 @@ class TestMainFunction(unittest.TestCase):
         proc_mock.returncode = 0
         mock_popen.return_value = proc_mock
 
-        with patch("sys.argv", ["acli", str(self.p_path)]):
-            with patch("sys.exit") as mock_exit:
-                main()
-                mock_exit.assert_called_once_with(0)
+        fake_home = self.p_path / "fake_home"
+        fake_home.mkdir()
+
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("sys.argv", ["acli", str(self.p_path)]):
+                with patch("sys.exit") as mock_exit:
+                    main()
+                    mock_exit.assert_called_once_with(0)
 
     @patch("acli.subprocess.run")
     def test_main_full_options_and_tool_mounts(self, mock_run):
@@ -587,6 +594,135 @@ class TestMainFunction(unittest.TestCase):
                     with patch("sys.exit") as mock_exit:
                         main()
                         mock_exit.assert_called_once_with(0)
+
+    @patch("acli.subprocess.run")
+    def test_main_userns_behavior(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="agcli-base latest\nheader line\n", returncode=0)
+        fake_home = self.p_path / "fake_home"
+        fake_home.mkdir()
+
+        # Helper to extract the podman run command from mock_run calls
+        def get_podman_run_cmd():
+            for call_args in mock_run.call_args_list:
+                args_list = call_args[0][0]
+                if len(args_list) >= 2 and args_list[0] == "podman" and args_list[1] == "run":
+                    return args_list
+            return None
+
+        # Case 1: default 'auto' userns, with os.getuid returning 1000 (rootless) and check_userns_supported returning True
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("os.getuid", return_value=1000):
+                with patch("sys.argv", ["acli", str(self.p_path)]):
+                    with patch("sys.exit") as mock_exit:
+                        main()
+                        mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        self.assertIn("--userns=keep-id:uid=0,gid=0", cmd)
+
+        # Case 2: default 'auto' userns, but check_userns_supported returns False
+        self.mock_userns_supported.return_value = False
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("os.getuid", return_value=1000):
+                with patch("sys.argv", ["acli", str(self.p_path)]):
+                    with patch("sys.exit") as mock_exit:
+                        main()
+                        mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        userns_flags = [arg for arg in cmd if arg.startswith("--userns")]
+        self.assertEqual(len(userns_flags), 0)
+
+        # Restore userns patcher to return True
+        self.mock_userns_supported.return_value = True
+
+        # Case 3: --userns=none explicitly passed
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("os.getuid", return_value=1000):
+                with patch("sys.argv", ["acli", str(self.p_path), "--userns", "none"]):
+                    with patch("sys.exit") as mock_exit:
+                        main()
+                        mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        userns_flags = [arg for arg in cmd if arg.startswith("--userns")]
+        self.assertEqual(len(userns_flags), 0)
+
+        # Case 4: --userns=keep-id explicitly passed
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("os.getuid", return_value=1000):
+                with patch("sys.argv", ["acli", str(self.p_path), "--userns", "keep-id"]):
+                    with patch("sys.exit") as mock_exit:
+                        main()
+                        mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        self.assertIn("--userns=keep-id", cmd)
+
+        # Case 5: ACLI_USERNS env var explicitly passed
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("os.getuid", return_value=1000):
+                with patch.dict(os.environ, {"ACLI_USERNS": "keep-id:uid=1000,gid=1000"}):
+                    with patch("sys.argv", ["acli", str(self.p_path)]):
+                        with patch("sys.exit") as mock_exit:
+                            main()
+                            mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        self.assertIn("--userns=keep-id:uid=1000,gid=1000", cmd)
+
+    @patch("acli.subprocess.run")
+    def test_check_userns_supported(self, mock_run):
+        # Stop global userns patcher to test the real implementation
+        self.userns_patcher.stop()
+        try:
+            from acli import check_userns_supported
+            mock_run.side_effect = None
+
+            # When subprocess returns 0
+            mock_run.return_value = MagicMock(returncode=0)
+            self.assertTrue(check_userns_supported("keep-id:uid=0,gid=0"))
+
+            # When subprocess returns non-zero
+            mock_run.return_value = MagicMock(returncode=1)
+            self.assertFalse(check_userns_supported("keep-id:uid=0,gid=0"))
+
+            # When subprocess raises exception
+            mock_run.side_effect = Exception("error")
+            self.assertFalse(check_userns_supported("keep-id:uid=0,gid=0"))
+        finally:
+            # Restart the patcher so other tests are unaffected
+            self.mock_userns_supported = self.userns_patcher.start()
+
+    def test_filter_mounts(self):
+        from acli import filter_mounts
+
+        mounted = set()
+        mounts_list = [
+            "-v", "/host/path1:/container/path1:ro",
+            "-v", "/host/path2:/container/path1",
+            "-v", "/host/path3:/container/path2",
+            "--tmpfs", "/container/path2",
+            "-e", "SOME_ENV=1",
+            "-v", "/host/path4:/container/path4"
+        ]
+
+        result = filter_mounts(mounts_list, mounted)
+        expected = [
+            "-v", "/host/path1:/container/path1:ro",
+            "-v", "/host/path3:/container/path2",
+            "-e", "SOME_ENV=1",
+            "-v", "/host/path4:/container/path4"
+        ]
+        self.assertEqual(result, expected)
+        self.assertIn(str(Path("/container/path1").resolve()), mounted)
+        self.assertIn(str(Path("/container/path2").resolve()), mounted)
+        self.assertIn(str(Path("/container/path4").resolve()), mounted)
 
     @patch("acli.subprocess.run")
     def test_main_entrypoint_block(self, mock_run):
