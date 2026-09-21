@@ -163,6 +163,10 @@ UDOCKER_WRAPPER
 
     cat << 'DOCKER_WRAPPER' > "$HOME/.local/bin/docker"
 #!/bin/bash
+if [ -S /var/run/docker.sock ]; then
+    exec "$HOME/.local/bin/docker.real" "$@"
+fi
+
 if [ $# -eq 0 ]; then
     exec udocker --help
 fi
@@ -285,8 +289,7 @@ case "$CMD" in
         ;;
 esac
 DOCKER_WRAPPER
-
-    cat << 'COMPOSE_WRAPPER' > "$HOME/.local/bin/docker-compose"
+    cat << 'COMPOSE_WRAPPER' > "$HOME/.local/bin/docker-compose.py"
 #!/usr/bin/env python3
 import argparse
 import os
@@ -527,6 +530,16 @@ def main():
 if __name__ == "__main__":
     main()
 COMPOSE_WRAPPER
+    chmod +x "$HOME/.local/bin/docker-compose.py"
+
+    cat << 'DOCKER_COMPOSE_WRAPPER' > "$HOME/.local/bin/docker-compose"
+#!/bin/bash
+if [ -S /var/run/docker.sock ]; then
+    exec "$HOME/.local/bin/docker-compose.real" "$@"
+else
+    exec "$HOME/.local/bin/docker-compose.py" "$@"
+fi
+DOCKER_COMPOSE_WRAPPER
 
     cat << 'PODMAN_WRAPPER' > "$HOME/.local/bin/podman"
 #!/bin/bash
@@ -545,6 +558,785 @@ PODMAN_COMPOSE_WRAPPER
 
     export UDOCKER_TARBALL=/tmp/udocker-englib-1.2.11.tar.gz
     udocker install
+
+    # Pre-fetch the default medium runner image for act
+    udocker pull catthehacker/ubuntu:act-latest
+
+    # Install nektos/act
+    if ! act --version &> /dev/null ; then
+        curl -L https://github.com/nektos/act/releases/latest/download/act_Linux_x86_64.tar.gz > /tmp/act.tar.gz
+        tar -zxvf /tmp/act.tar.gz -C /tmp act
+        mv /tmp/act "$HOME/.local/bin/act"
+        chmod +x "$HOME/.local/bin/act"
+    fi
+
+    # Install static docker client binary
+    if [ ! -f "$HOME/.local/bin/docker.real" ] ; then
+        curl -L https://download.docker.com/linux/static/stable/x86_64/docker-27.1.1.tgz > /tmp/docker.tgz
+        tar -zxvf /tmp/docker.tgz -C /tmp docker/docker
+        mv /tmp/docker/docker "$HOME/.local/bin/docker.real"
+        chmod +x "$HOME/.local/bin/docker.real"
+    fi
+
+    # Install static docker-compose client binary
+    if [ ! -f "$HOME/.local/bin/docker-compose.real" ] ; then
+        curl -L https://github.com/docker/compose/releases/download/v2.29.1/docker-compose-linux-x86_64 > "$HOME/.local/bin/docker-compose.real"
+        chmod +x "$HOME/.local/bin/docker-compose.real"
+    fi
+
+    # Install udocker HTTP daemon
+    cat << 'UDOCKER_DAEMON_SCRIPT' > "$HOME/.local/bin/udocker_daemon.py"
+#!/usr/bin/env python3
+import socket
+import os
+import sys
+import json
+import urllib.parse
+import subprocess
+import threading
+import struct
+import tarfile
+import io
+import shutil
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+SOCKET_PATH = "/var/run/docker.sock"
+UDOCKER_BIN = "/home/adam/.local/udocker-1.3.17/udocker/udocker"
+
+# Databases to map containers and exec processes
+containers_db = {}
+execs_db = {}
+
+# Ensure the socket is clean before startup
+if os.path.exists(SOCKET_PATH):
+    try:
+        os.remove(SOCKET_PATH)
+    except Exception:
+        pass
+
+def normalize_image_name(name):
+    if name.startswith("docker.io/"):
+        name = name[len("docker.io/"):]
+    if name.startswith("library/"):
+        name = name[len("library/"):]
+    return name
+
+def make_frame(stream_type, data):
+    # Docker raw stream frame: 1 byte stream type (1=stdout, 2=stderr), 3 bytes empty, 4 bytes size
+    return struct.pack(">BXXXI", stream_type, len(data)) + data
+
+def run_udocker_cmd(args):
+    cmd = [UDOCKER_BIN, "--allow-root"] + args
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.returncode, res.stdout, res.stderr
+
+def resolve_container_path(container_root, path_in_container):
+    container_root = os.path.abspath(container_root)
+    parts = [p for p in path_in_container.split("/") if p and p != "."]
+    resolved = container_root
+    
+    for part in parts:
+        if part == "..":
+            parent = os.path.dirname(resolved)
+            if parent.startswith(container_root):
+                resolved = parent
+            continue
+            
+        next_path = os.path.join(resolved, part)
+        if os.path.islink(next_path):
+            target = os.readlink(next_path)
+            if target.startswith("/"):
+                resolved = resolve_container_path(container_root, target)
+            else:
+                resolved = resolve_container_path(container_root, os.path.join(os.path.dirname(next_path), target))
+        else:
+            resolved = next_path
+            
+    return resolved
+
+class UnixHTTPServer(HTTPServer):
+    def server_bind(self):
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.bind(self.server_address)
+        self.socket.listen(5)
+
+class DockerAPIHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def address_string(self):
+        return "unix"
+
+    def handle_error(self, status_code, message):
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({"message": message}).encode('utf-8'))
+
+    def do_HEAD(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        
+        if path.startswith("/v1."):
+            parts = path.split("/", 2)
+            if len(parts) > 2:
+                path = "/" + parts[2]
+            else:
+                path = "/"
+
+        if path == "/_ping":
+            self.send_response(200)
+            self.send_header('API-Version', '1.41')
+            self.send_header('Docker-Experimental', 'false')
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            return
+
+        elif path.startswith("/containers/") and path.endswith("/archive"):
+            parts = path.split("/")
+            cid = parts[2]
+            src_path_in_container = query_params.get("path", [""])[0]
+
+            if cid in containers_db:
+                container_root = f"/home/adam/.udocker/containers/{cid}/ROOT"
+                src_path = resolve_container_path(container_root, src_path_in_container)
+                
+                if not os.path.exists(src_path):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+
+                # Get path stats
+                import base64
+                import time
+                stat = os.stat(src_path)
+                mtime_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stat.st_mtime))
+                stat_info = {
+                    "name": os.path.basename(src_path),
+                    "size": stat.st_size,
+                    "mode": stat.st_mode,
+                    "mtime": mtime_str,
+                    "linkTarget": ""
+                }
+                if os.path.islink(src_path):
+                    stat_info["linkTarget"] = os.readlink(src_path)
+
+                stat_json = json.dumps(stat_info)
+                stat_b64 = base64.b64encode(stat_json.encode('utf-8')).decode('utf-8')
+
+                self.send_response(200)
+                self.send_header('X-Docker-Container-Path-Stat', stat_b64)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_GET(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        
+        # Strip API version prefix if present, e.g., /v1.41/info -> /info
+        if path.startswith("/v1."):
+            parts = path.split("/", 2)
+            if len(parts) > 2:
+                path = "/" + parts[2]
+            else:
+                path = "/"
+
+        if path == "/_ping":
+            self.send_response(200)
+            self.send_header('API-Version', '1.41')
+            self.send_header('Docker-Experimental', 'false')
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+
+        elif path == "/version":
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            version_info = {
+                "Platform": { "Name": "" },
+                "Components": [
+                    {
+                        "Name": "Engine",
+                        "Version": "20.10.23",
+                        "Details": {
+                            "ApiVersion": "1.41",
+                            "Arch": "amd64",
+                            "BuildTime": "2023-02-01T00:00:00.000000000+00:00",
+                            "Experimental": "false",
+                            "GitCommit": "7b79a00",
+                            "GoVersion": "go1.19.5",
+                            "KernelVersion": "6.8.0",
+                            "MinAPIVersion": "1.12",
+                            "Os": "linux"
+                        }
+                    }
+                ],
+                "Version": "20.10.23",
+                "ApiVersion": "1.41",
+                "MinAPIVersion": "1.12",
+                "GitCommit": "7b79a00",
+                "GoVersion": "go1.19.5",
+                "Os": "linux",
+                "Arch": "amd64",
+                "KernelVersion": "6.8.0",
+                "BuildTime": "2023-02-01T00:00:00.000000000+00:00"
+            }
+            self.wfile.write(json.dumps(version_info).encode('utf-8'))
+            return
+
+        elif path == "/info":
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            info = {
+                "ID": "udocker-daemon",
+                "Containers": len(containers_db),
+                "Images": 1,
+                "Driver": "udocker",
+                "SystemStatus": None,
+                "KernelVersion": "6.8.0",
+                "OperatingSystem": "Debian GNU/Linux 12 (bookworm)",
+                "OSType": "linux",
+                "Architecture": "x86_64",
+                "NCPU": 4,
+                "MemTotal": 16000000000,
+                "ServerVersion": "20.10.0"
+            }
+            self.wfile.write(json.dumps(info).encode('utf-8'))
+            return
+
+        elif path.startswith("/images/") and path.endswith("/json"):
+            # Check if specific image exists, return dummy image metadata
+            image_name = path[len("/images/"):-len("/json")]
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            img_info = {
+                "Id": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                "RepoTags": [urllib.parse.unquote(image_name)],
+                "Size": 100000000
+            }
+            self.wfile.write(json.dumps(img_info).encode('utf-8'))
+            return
+
+        elif path == "/images/json":
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            # Return alpine and any images pulled
+            self.wfile.write(json.dumps([
+                {"Id": "sha256:alpine", "RepoTags": ["alpine:latest"]},
+                {"Id": "sha256:ubuntu", "RepoTags": ["catthehacker/ubuntu:act-latest"]}
+            ]).encode('utf-8'))
+            return
+
+        elif path == "/containers/json":
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            res_list = []
+            for cid, cdata in containers_db.items():
+                res_list.append({
+                    "Id": cid,
+                    "Names": [f"/acli-task"],
+                    "Image": cdata["Image"],
+                    "State": cdata["State"],
+                    "Status": cdata["State"]
+                })
+            self.wfile.write(json.dumps(res_list).encode('utf-8'))
+            return
+
+        elif path.startswith("/containers/") and path.endswith("/json"):
+            cid = path[len("/containers/"):-len("/json")]
+            if cid and cid != "json" and cid in containers_db:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                c_info = {
+                    "Id": cid,
+                    "State": {
+                        "Running": containers_db[cid]["State"] == "running",
+                        "Status": containers_db[cid]["State"]
+                    },
+                    "Config": {
+                        "Env": containers_db[cid].get("Env", [])
+                    }
+                }
+                self.wfile.write(json.dumps(c_info).encode('utf-8'))
+            else:
+                self.handle_error(404, f"No such container: {cid}")
+            return
+
+        elif path == "/volumes":
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"Volumes": [], "Warnings": []}).encode('utf-8'))
+            return
+
+        elif path.startswith("/volumes/") and not path.endswith("/json"):
+            v_name = path[len("/volumes/"):]
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "CreatedAt": "2020-01-01T00:00:00Z",
+                "Driver": "local",
+                "Labels": {},
+                "Mountpoint": f"/tmp/docker-volumes/{v_name}",
+                "Name": v_name,
+                "Options": {},
+                "Scope": "local"
+            }).encode('utf-8'))
+            return
+
+        elif path.startswith("/containers/") and path.endswith("/archive"):
+            parts = path.split("/")
+            cid = parts[2]
+            src_path_in_container = query_params.get("path", [""])[0]
+
+            if cid in containers_db:
+                container_root = f"/home/adam/.udocker/containers/{cid}/ROOT"
+                src_path = resolve_container_path(container_root, src_path_in_container)
+                
+                if not os.path.exists(src_path):
+                    self.handle_error(404, f"Path not found: {src_path_in_container}")
+                    return
+
+                # Get path stats
+                import base64
+                import time
+                stat = os.stat(src_path)
+                mtime_str = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stat.st_mtime))
+                stat_info = {
+                    "name": os.path.basename(src_path),
+                    "size": stat.st_size,
+                    "mode": stat.st_mode,
+                    "mtime": mtime_str,
+                    "linkTarget": ""
+                }
+                if os.path.islink(src_path):
+                    stat_info["linkTarget"] = os.readlink(src_path)
+
+                stat_json = json.dumps(stat_info)
+                stat_b64 = base64.b64encode(stat_json.encode('utf-8')).decode('utf-8')
+
+                # Create tarball in memory
+                tar_stream = io.BytesIO()
+                with tarfile.open(fileobj=tar_stream, mode='w') as tar:
+                    tar.add(src_path, arcname=os.path.basename(src_path))
+                
+                tar_data = tar_stream.getvalue()
+                
+                self.send_response(200)
+                self.send_header('X-Docker-Container-Path-Stat', stat_b64)
+                self.send_header('Content-Type', 'application/x-tar')
+                self.send_header('Content-Length', str(len(tar_data)))
+                self.end_headers()
+                self.wfile.write(tar_data)
+            else:
+                self.handle_error(404, f"No such container: {cid}")
+            return
+
+        elif path.startswith("/exec/") and path.endswith("/json"):
+            exec_id = path[len("/exec/"):-len("/json")]
+            if exec_id in execs_db:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "ID": exec_id,
+                    "Running": execs_db[exec_id].get("Running", False),
+                    "ExitCode": execs_db[exec_id].get("ExitCode", 0),
+                    "ContainerID": execs_db[exec_id]["container_id"]
+                }).encode('utf-8'))
+            else:
+                self.handle_error(404, f"No such exec: {exec_id}")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        
+        if path.startswith("/v1."):
+            parts = path.split("/", 2)
+            if len(parts) > 2:
+                path = "/" + parts[2]
+            else:
+                path = "/"
+
+        # Read request body
+        content_length = int(self.headers.get('Content-Length', 0))
+        if self.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+            body = b""
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    break
+                chunk_size = int(line, 16)
+                if chunk_size == 0:
+                    self.rfile.readline()
+                    break
+                body += self.rfile.read(chunk_size)
+                self.rfile.readline()
+        else:
+            body = self.rfile.read(content_length)
+
+        if path == "/volumes/create":
+            body_json = {}
+            if body:
+                try:
+                    body_json = json.loads(body.decode('utf-8'))
+                except Exception:
+                    pass
+            v_name = body_json.get("Name") or f"vol_{os.urandom(4).hex()}"
+            v_dir = f"/tmp/docker-volumes/{v_name}"
+            os.makedirs(v_dir, exist_ok=True)
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "CreatedAt": "2020-01-01T00:00:00Z",
+                "Driver": "local",
+                "Labels": {},
+                "Mountpoint": v_dir,
+                "Name": v_name,
+                "Options": {},
+                "Scope": "local"
+            }).encode('utf-8'))
+            return
+
+        elif path == "/images/create":
+            from_image = query_params.get("fromImage", [""])[0]
+            tag = query_params.get("tag", ["latest"])[0]
+            image_name = f"{from_image}:{tag}"
+            normalized_name = normalize_image_name(image_name)
+            
+            # Start pull process
+            sys.stderr.write(f"Pulling image via udocker: {normalized_name}\n")
+            cmd = [UDOCKER_BIN, "--allow-root", "pull", normalized_name]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            
+            self.wfile.write(json.dumps({"status": f"Pulling from {from_image}", "id": tag}).encode('utf-8') + b"\r\n")
+            self.wfile.flush()
+            
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                status_text = line.decode('utf-8', errors='ignore').strip()
+                if status_text:
+                    try:
+                        self.wfile.write(json.dumps({"status": status_text}).encode('utf-8') + b"\r\n")
+                        self.wfile.flush()
+                    except Exception:
+                        break
+            proc.wait()
+            self.wfile.write(json.dumps({"status": f"Status: Downloaded image {image_name}"}).encode('utf-8') + b"\r\n")
+            return
+
+        elif path == "/containers/create":
+            body_json = json.loads(body.decode('utf-8'))
+            image = body_json.get("Image", "")
+            normalized_image = normalize_image_name(image)
+            env = body_json.get("Env") or []
+            cmd_args = body_json.get("Cmd") or []
+            working_dir = body_json.get("WorkingDir") or ""
+            host_config = body_json.get("HostConfig") or {}
+            binds = host_config.get("Binds") or []
+
+            # Create container using udocker
+            sys.stderr.write(f"Creating container from image: {normalized_image}\n")
+            ret, stdout, stderr = run_udocker_cmd(["create", normalized_image])
+            if ret != 0:
+                self.handle_error(500, f"Failed to create container: {stderr}")
+                return
+
+            cid = stdout.strip().splitlines()[-1].strip()
+            containers_db[cid] = {
+                "Image": image,
+                "NormalizedImage": normalized_image,
+                "Env": env,
+                "Cmd": cmd_args,
+                "WorkingDir": working_dir,
+                "Binds": binds,
+                "State": "created"
+            }
+            
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"Id": cid, "Warnings": []}).encode('utf-8'))
+            return
+
+        elif path.startswith("/containers/") and path.endswith("/start"):
+            parts = path.split("/")
+            cid = parts[2]
+            if cid in containers_db:
+                containers_db[cid]["State"] = "running"
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self.handle_error(404, f"No such container: {cid}")
+            return
+
+        elif path.startswith("/containers/") and path.endswith("/stop"):
+            parts = path.split("/")
+            cid = parts[2]
+            if cid in containers_db:
+                containers_db[cid]["State"] = "stopped"
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self.handle_error(404, f"No such container: {cid}")
+            return
+
+        elif path.startswith("/containers/") and path.endswith("/exec"):
+            parts = path.split("/")
+            cid = parts[2]
+            if cid in containers_db:
+                body_json = json.loads(body.decode('utf-8'))
+                exec_cmd = body_json.get("Cmd") or []
+                exec_env = body_json.get("Env") or []
+                
+                exec_id = f"exec_{len(execs_db) + 1}_{os.urandom(4).hex()}"
+                execs_db[exec_id] = {
+                    "container_id": cid,
+                    "Cmd": exec_cmd,
+                    "Env": exec_env,
+                    "ExitCode": 0,
+                    "Running": True
+                }
+                
+                self.send_response(201)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"Id": exec_id}).encode('utf-8'))
+            else:
+                self.handle_error(404, f"No such container: {cid}")
+            return
+
+        elif path.startswith("/exec/") and path.endswith("/start"):
+            parts = path.split("/")
+            exec_id = parts[2]
+            if exec_id in execs_db:
+                exec_data = execs_db[exec_id]
+                cid = exec_data["container_id"]
+                c_data = containers_db[cid]
+
+                # Combine arguments for udocker run
+                run_args = ["run"]
+                for bind in c_data.get("Binds", []):
+                    run_args.extend(["-v", bind])
+                
+                # Combine environment
+                combined_env = {}
+                for e in c_data.get("Env", []):
+                    if "=" in e:
+                        k, v = e.split("=", 1)
+                        combined_env[k] = v
+                for e in exec_data.get("Env", []):
+                    if "=" in e:
+                        k, v = e.split("=", 1)
+                        combined_env[k] = v
+                for k, v in combined_env.items():
+                    run_args.extend(["-e", f"{k}={v}"])
+
+                if c_data.get("WorkingDir"):
+                    run_args.extend(["--workdir", c_data["WorkingDir"]])
+
+                run_args.append(cid)
+                run_args.extend(exec_data["Cmd"])
+
+                # Build environment for the subprocess running udocker
+                sub_env = os.environ.copy()
+                sub_env["UDOCKER_LOGLEVEL"] = "0"
+
+                sys.stderr.write(f"Executing in container {cid}: {exec_data['Cmd']}\n")
+                proc = subprocess.Popen([UDOCKER_BIN, "--allow-root"] + run_args,
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE,
+                                      env=sub_env)
+
+                self.send_response(101, "Switching Protocols")
+                self.send_header('Connection', 'Upgrade')
+                self.send_header('Upgrade', 'tcp')
+                self.end_headers()
+
+                # Multiplex process output into raw stream frames
+                conn = self.wfile
+                def reader(stream, stream_type):
+                    try:
+                        while True:
+                            chunk = stream.read(4096)
+                            if not chunk:
+                                break
+                            frame = make_frame(stream_type, chunk)
+                            conn.write(frame)
+                            conn.flush()
+                    except Exception:
+                        pass
+
+                t1 = threading.Thread(target=reader, args=(proc.stdout, 1))
+                t2 = threading.Thread(target=reader, args=(proc.stderr, 2))
+                t1.start()
+                t2.start()
+                t1.join()
+                t2.join()
+                proc.wait()
+                execs_db[exec_id]["ExitCode"] = proc.returncode
+                execs_db[exec_id]["Running"] = False
+            else:
+                self.handle_error(404, f"No such exec: {exec_id}")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+
+        if path.startswith("/v1."):
+            parts = path.split("/", 2)
+            if len(parts) > 2:
+                path = "/" + parts[2]
+            else:
+                path = "/"
+
+        # Read request body
+        content_length = int(self.headers.get('Content-Length', 0))
+        if self.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+            body = b""
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    break
+                chunk_size = int(line, 16)
+                if chunk_size == 0:
+                    self.rfile.readline()
+                    break
+                body += self.rfile.read(chunk_size)
+                self.rfile.readline()
+        else:
+            body = self.rfile.read(content_length)
+
+        if path.startswith("/containers/") and path.endswith("/archive"):
+            parts = path.split("/")
+            cid = parts[2]
+            dest_path_in_container = query_params.get("path", [""])[0]
+
+            if cid in containers_db:
+                container_root = f"/home/adam/.udocker/containers/{cid}/ROOT"
+                dest_root = resolve_container_path(container_root, dest_path_in_container)
+                os.makedirs(dest_root, exist_ok=True)
+
+                sys.stderr.write(f"Extracting archive to container {cid} path {dest_path_in_container} -> {dest_root}\n")
+                try:
+                    tar = tarfile.open(fileobj=io.BytesIO(body))
+                    sys.stderr.write(f"Tarball members: {[m.name for m in tar.getmembers()]}\n")
+                    try:
+                        tar.extractall(path=dest_root, filter='fully_trusted')
+                    except TypeError:
+                        tar.extractall(path=dest_root)
+                    tar.close()
+                    
+                    self.send_response(200)
+                    self.end_headers()
+                except Exception as e:
+                    import traceback
+                    sys.stderr.write(f"Tarball extraction failed: {str(e)}\n")
+                    traceback.print_exc(file=sys.stderr)
+                    self.handle_error(500, f"Failed to extract tarball: {str(e)}")
+            else:
+                self.handle_error(404, f"No such container: {cid}")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_DELETE(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        
+        if path.startswith("/v1."):
+            parts = path.split("/", 2)
+            if len(parts) > 2:
+                path = "/" + parts[2]
+            else:
+                path = "/"
+
+        if path.startswith("/containers/"):
+            parts = path.split("/")
+            cid = parts[2]
+            sys.stderr.write(f"Removing container: {cid}\n")
+            run_udocker_cmd(["rm", cid])
+            if cid in containers_db:
+                del containers_db[cid]
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        elif path.startswith("/volumes/"):
+            v_name = path[len("/volumes/"):]
+            v_dir = f"/tmp/docker-volumes/{v_name}"
+            if os.path.exists(v_dir):
+                shutil.rmtree(v_dir, ignore_errors=True)
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+def main():
+    sys.stderr.write(f"Starting udocker daemon on {SOCKET_PATH}\n")
+    server = UnixHTTPServer(SOCKET_PATH, DockerAPIHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)
+
+if __name__ == "__main__":
+    main()
+
+UDOCKER_DAEMON_SCRIPT
+    chmod +x "$HOME/.local/bin/udocker_daemon.py"
+
+    # Start the daemon in .bashrc if not running
+    cat << 'BASHRC_DAEMON_STARTER' >> "$HOME/.bashrc"
+if [ ! -S /var/run/docker.sock ]; then
+    python3 "$HOME/.local/bin/udocker_daemon.py" > /tmp/udocker_daemon.log 2>&1 &
+    for i in {1..30}; do
+        [ -S /var/run/docker.sock ] && break
+        sleep 0.1
+    done
+fi
+BASHRC_DAEMON_STARTER
 fi
 rm -rv /tmp/*
 """
@@ -768,6 +1560,7 @@ def main():
     parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
     parser.add_argument("--userns", default=None, help="User namespace mode for Podman (e.g. keep-id:uid=0,gid=0, none)")
+    parser.add_argument("--rebuild", action="store_true", help="Force rebuild the agcli-base image")
 
     args = parser.parse_args()
 
@@ -785,7 +1578,8 @@ def main():
         text=True,
     )
     lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
-    if len(lines) <= 1:
+    if len(lines) <= 1 or args.rebuild:
+        subprocess.run(["podman", "rmi", "-f", "agcli-base"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["podman", "rm", "agcli-base", "debian"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         host_home = os.environ.get("HOME", "/root")
         proc = subprocess.Popen(
