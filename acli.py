@@ -81,6 +81,11 @@ if ! claude --version &> /dev/null; then
     echo 'alias claude="IS_SANDBOX=1 claude --dangerously-skip-permissions"' >> "$HOME/.bashrc"
 fi
 
+if ! codex --version &> /dev/null; then
+    curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
+    echo 'alias codex="codex --dangerously-bypass-approvals-and-sandbox"' >> "$HOME/.bashrc"
+fi
+
 if ! udocker --version &> /dev/null ; then
     curl -L https://github.com/indigo-dc/udocker/releases/download/1.3.17/udocker-1.3.17.tar.gz > /tmp/udocker-1.3.17.tar.gz
     curl -L https://github.com/jorge-lip/udocker-builds/raw/master/tarballs/udocker-englib-1.2.11.tar.gz > /tmp/udocker-englib-1.2.11.tar.gz
@@ -1557,7 +1562,7 @@ def main():
     parser.add_argument("--mask-env", action=argparse.BooleanOptionalAction, default=None, help="Mask .env* files as empty 0-byte files")
     parser.add_argument("--tools-ro", action=argparse.BooleanOptionalAction, default=None, help="Mount tool root directories as read-only")
     parser.add_argument("--persistence", choices=["per-project", "global"], default=None, help="Tool state persistence mode (default: per-project)")
-    parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude)")
+    parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude, codex)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
     parser.add_argument("--userns", default=None, help="User namespace mode for Podman (e.g. keep-id:uid=0,gid=0, none)")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild the agcli-base image")
@@ -1594,7 +1599,7 @@ def main():
 
     # Resolution order: CLI Arguments > Environment Variables > Defaults
     acli_memory = args.memory or os.environ.get("ACLI_MEMORY", "16G")
-    acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity,claude")
+    acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity,claude,codex")
 
     if args.persistence is not None:
         acli_persistence = args.persistence.strip().lower()
@@ -1808,6 +1813,14 @@ def main():
                     volumes.extend(["-v", f"{claude_json}:{claude_json}"])
             volumes.extend(["-e", "DISABLE_AUTOUPDATER=1"])
             volumes.extend(["-e", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"])
+        elif t == "codex" and (home_path / ".codex").is_dir():
+            codex_dir = home_path / ".codex"
+            if acli_tools_ro and acli_persistence == "per-project":
+                codex_storage = proj_storage_root / "codex" / "config"
+                copy_with_cow_rsync_fallback(codex_dir, codex_storage)
+                volumes.extend(["-v", f"{codex_storage}:{codex_dir}"])
+            else:
+                volumes.extend(["-v", f"{codex_dir}:{codex_dir}"])
 
     p_path = Path(project_dir)
 

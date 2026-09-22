@@ -329,6 +329,7 @@ class TestMainFunction(unittest.TestCase):
         mock_run.side_effect = [
             MagicMock(stdout="REPOSITORY TAG IMAGE ID CREATED SIZE\n"),
             MagicMock(returncode=0),
+            MagicMock(returncode=0),
         ]
         proc_mock = MagicMock()
         proc_mock.communicate.return_value = (b"", b"")
@@ -345,6 +346,7 @@ class TestMainFunction(unittest.TestCase):
     def test_main_agcli_base_missing_creation_success(self, mock_popen, mock_run):
         mock_run.side_effect = [
             MagicMock(stdout="REPOSITORY TAG IMAGE ID CREATED SIZE\n"),
+            MagicMock(returncode=0),
             MagicMock(returncode=0),
             MagicMock(returncode=0),
             MagicMock(returncode=0),
@@ -402,6 +404,13 @@ class TestMainFunction(unittest.TestCase):
         (claude_dir / ".credentials.json").write_text('{"token": "test"}')
         claude_json = fake_home / ".claude.json"
         claude_json.write_text('{"oauth": "token"}')
+
+        codex_dir = fake_home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text('model = "o3"\n')
+        (codex_dir / "instructions.md").write_text("# Instructions\n")
+        (codex_dir / "auth.json").write_text('{"token": "test"}')
+        (codex_dir / "history.jsonl").write_text('{"session": "test"}\n')
 
         (self.p_path / ".gitignore").write_text("ignored.txt\n")
         (self.p_path / "ignored.txt").touch()
@@ -466,6 +475,11 @@ class TestMainFunction(unittest.TestCase):
         claude_proj_config.mkdir(parents=True, exist_ok=True)
         (claude_proj_config / "settings.json").write_text("{}")
         (claude_proj_storage / ".claude.json").write_text('{"oauth": "cached"}')
+
+        codex_proj_storage = fake_home / ".acli" / "projects" / project_slug / "codex"
+        codex_proj_config = codex_proj_storage / "config"
+        codex_proj_config.mkdir(parents=True, exist_ok=True)
+        (codex_proj_config / "config.toml").write_text('model = "o3"\n')
 
         # Test case 1: git-mode=ro, git-hooks-mode=tmpfs, persistence=per-project, tools-ro=true
         with patch("pathlib.Path.home", return_value=fake_home):
@@ -537,9 +551,13 @@ class TestMainFunction(unittest.TestCase):
         claude_json = fake_home / ".claude.json"
         claude_json.write_text('{"oauth": "token"}')
 
+        codex_dir = fake_home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text('model = "o3"\n')
+
         env_override = {
             "ACLI_MEMORY": "32G",
-            "ACLI_TOOLS": "copilot,vibe,antigravity,claude",
+            "ACLI_TOOLS": "copilot,vibe,antigravity,claude,codex",
             "ACLI_PERSISTENCE": "invalid_persistence_value",
             "ACLI_TOOLS_RO": "1",
             "ACLI_GIT_MODE": "",
