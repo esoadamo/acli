@@ -1,6 +1,6 @@
 # acli
 
-`acli` is a secure container wrapper around agentic CLIs (such as GitHub Copilot CLI, Mistral Vibe, Google Antigravity, and Anthropic Claude Code). It launches agentic tasks inside an isolated Podman dev environment to prevent agents from breaking out ("escaping from jail"), overwriting critical host files, or reading sensitive environment secrets.
+`acli` is a secure container wrapper around agentic CLIs (such as GitHub Copilot CLI, Mistral Vibe, Google Antigravity, Anthropic Claude Code, and OpenAI Codex CLI). It launches agentic tasks inside an isolated Podman dev environment to prevent agents from breaking out ("escaping from jail"), overwriting critical host files, or reading sensitive environment secrets.
 
 ---
 
@@ -24,6 +24,7 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
   - **Mistral Vibe** (`vibe`)
   - **GitHub Copilot CLI** (`copilot`)
   - **Anthropic Claude Code** (`claude`)
+  - **OpenAI Codex CLI** (`codex`)
   - **Continue CLI** (`cn`)
   - **Pi CLI** (`pi`)
 - **Container Engine & Docker Tools**:
@@ -79,7 +80,7 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
 | `--mask-env` / `--no-mask-env` | `ACLI_MASK_ENV` | Mask `.env*` files as 0-byte empty files | `true` (`--mask-env`) | `true`, `false` |
 | `--tools-ro` / `--no-tools-ro` | `ACLI_TOOLS_RO` | Mount tool configuration root directories as read-only | `true` (`--tools-ro`) | `true`, `false` |
 | `--persistence` | `ACLI_PERSISTENCE` | Session state and persistence storage scoping | `per-project` | `per-project`, `global` |
-| `--tools` | `ACLI_TOOLS` | Comma-separated agent CLI tool profiles to mount | `copilot,vibe,antigravity,claude` | Any combination of `copilot`, `vibe`, `antigravity`, `claude` |
+| `--tools` | `ACLI_TOOLS` | Comma-separated agent CLI tool profiles to mount | `copilot,vibe,antigravity,claude,codex` | Any combination of `copilot`, `vibe`, `antigravity`, `claude`, `codex` |
 | `--memory` | `ACLI_MEMORY` | Container memory limit | `16G` | E.g., `4G`, `8G`, `16G`, `32G` |
 
 ### Gitignore Modes
@@ -118,5 +119,5 @@ The `--gitignore-mode` option controls how files and directories matched by `.gi
 
 - **Running with specific tools & reduced memory:**
   ```bash
-  uv run acli . --tools vibe,antigravity,claude --memory 8G
+  uv run acli . --tools vibe,antigravity,claude,codex --memory 8G
   ```

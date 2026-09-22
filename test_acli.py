@@ -316,6 +316,89 @@ class TestMainFunction(unittest.TestCase):
                 os.chmod(os.path.join(root, f), 0o666)
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
+    @patch("acli.subprocess.run")
+    def test_codex_credentials_survive_relaunch(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout="REPOSITORY TAG IMAGE ID CREATED SIZE\nagcli-base latest test\n",
+            returncode=0,
+        )
+        fake_home = self.p_path / "home"
+        codex_dir = fake_home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "auth.json").write_text("host-credential")
+        slug = str(self.p_path.resolve()).replace("/", "_").lstrip("_")
+        storage = fake_home / ".acli" / "projects" / slug / "codex" / "config"
+
+        def seed(src, dst):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dst)
+
+        with patch("pathlib.Path.home", return_value=fake_home), patch(
+            "sys.argv", ["acli", str(self.p_path), "--tools", "codex",
+                         "--persistence", "per-project", "--tools-ro"]
+        ), patch("sys.exit"), patch(
+            "acli.copy_with_cow_rsync_fallback", side_effect=seed
+        ) as copy:
+            main()
+            self.assertEqual((storage / "auth.json").read_text(), "host-credential")
+            (storage / "auth.json").write_text("refreshed-container-credential")
+            main()
+            self.assertEqual((storage / "auth.json").read_text(),
+                             "refreshed-container-credential")
+            copy.assert_called_once_with(codex_dir, storage)
+            run_cmd = mock_run.call_args.args[0]
+            self.assertIn(f"{storage}:{codex_dir}", run_cmd)
+
+    @patch("acli.subprocess.run")
+    def test_antigravity_settings_and_credentials_survive_relaunch(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout="REPOSITORY TAG IMAGE ID CREATED SIZE\nagcli-base latest test\n",
+            returncode=0,
+        )
+        fake_home = self.p_path / "home"
+        ag_dir = fake_home / ".gemini" / "antigravity-cli"
+        ag_dir.mkdir(parents=True)
+        (ag_dir / "settings.json").write_text("host-credential")
+        slug = str(self.p_path.resolve()).replace("/", "_").lstrip("_")
+        storage = fake_home / ".acli" / "projects" / slug / "antigravity-cli" / "config"
+
+        def seed(src, dst):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(src, dst)
+
+        with patch("pathlib.Path.home", return_value=fake_home), patch(
+            "sys.argv", ["acli", str(self.p_path), "--tools", "antigravity",
+                         "--persistence", "per-project", "--tools-ro"]
+        ), patch("sys.exit"), patch(
+            "acli.copy_with_cow_rsync_fallback", side_effect=seed
+        ) as copy:
+            main()
+            self.assertEqual((storage / "settings.json").read_text(), "host-credential")
+            (storage / "settings.json").write_text("refreshed-container-credential")
+            main()
+            self.assertEqual((storage / "settings.json").read_text(),
+                             "refreshed-container-credential")
+            copy.assert_called_once_with(ag_dir, storage)
+            run_cmd = mock_run.call_args.args[0]
+            self.assertIn(f"{storage}:{ag_dir}", run_cmd)
+
+    @patch("acli.subprocess.run")
+    def test_codex_mount_without_existing_host_configuration(self, mock_run):
+        mock_run.return_value = MagicMock(
+            stdout="REPOSITORY TAG IMAGE ID CREATED SIZE\nagcli-base latest test\n",
+            returncode=0,
+        )
+        fake_home = self.p_path / "home"
+        with patch("pathlib.Path.home", return_value=fake_home), patch(
+            "sys.argv", ["acli", str(self.p_path), "--tools", "codex",
+                         "--persistence", "global"]
+        ), patch("sys.exit"):
+            main()
+        codex_dir = fake_home / ".codex"
+        self.assertTrue(codex_dir.is_dir())
+        self.assertEqual(codex_dir.stat().st_mode & 0o777, 0o700)
+        self.assertIn(f"{codex_dir}:{codex_dir}", mock_run.call_args.args[0])
+
     def test_main_nonexistent_project_dir(self):
         non_existent = str(self.p_path / "no_dir")
         with patch("sys.argv", ["acli", non_existent]):
@@ -328,6 +411,7 @@ class TestMainFunction(unittest.TestCase):
     def test_main_agcli_base_missing_creation_failure(self, mock_popen, mock_run):
         mock_run.side_effect = [
             MagicMock(stdout="REPOSITORY TAG IMAGE ID CREATED SIZE\n"),
+            MagicMock(returncode=0),
             MagicMock(returncode=0),
         ]
         proc_mock = MagicMock()
@@ -349,6 +433,7 @@ class TestMainFunction(unittest.TestCase):
             MagicMock(returncode=0),
             MagicMock(returncode=0),
             MagicMock(returncode=0),
+            MagicMock(returncode=0),
         ]
         proc_mock = MagicMock()
         proc_mock.communicate.return_value = (b"", b"")
@@ -359,7 +444,7 @@ class TestMainFunction(unittest.TestCase):
         fake_home.mkdir()
 
         with patch("pathlib.Path.home", return_value=fake_home):
-            with patch("sys.argv", ["acli", str(self.p_path)]):
+            with patch("sys.argv", ["acli", str(self.p_path), "--tools", "copilot"]):
                 with patch("sys.exit") as mock_exit:
                     main()
                     mock_exit.assert_called_once_with(0)
@@ -402,6 +487,13 @@ class TestMainFunction(unittest.TestCase):
         (claude_dir / ".credentials.json").write_text('{"token": "test"}')
         claude_json = fake_home / ".claude.json"
         claude_json.write_text('{"oauth": "token"}')
+
+        codex_dir = fake_home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text('model = "o3"\n')
+        (codex_dir / "instructions.md").write_text("# Instructions\n")
+        (codex_dir / "auth.json").write_text('{"token": "test"}')
+        (codex_dir / "history.jsonl").write_text('{"session": "test"}\n')
 
         (self.p_path / ".gitignore").write_text("ignored.txt\n")
         (self.p_path / "ignored.txt").touch()
@@ -466,6 +558,11 @@ class TestMainFunction(unittest.TestCase):
         claude_proj_config.mkdir(parents=True, exist_ok=True)
         (claude_proj_config / "settings.json").write_text("{}")
         (claude_proj_storage / ".claude.json").write_text('{"oauth": "cached"}')
+
+        codex_proj_storage = fake_home / ".acli" / "projects" / project_slug / "codex"
+        codex_proj_config = codex_proj_storage / "config"
+        codex_proj_config.mkdir(parents=True, exist_ok=True)
+        (codex_proj_config / "config.toml").write_text('model = "o3"\n')
 
         # Test case 1: git-mode=ro, git-hooks-mode=tmpfs, persistence=per-project, tools-ro=true
         with patch("pathlib.Path.home", return_value=fake_home):
@@ -537,9 +634,13 @@ class TestMainFunction(unittest.TestCase):
         claude_json = fake_home / ".claude.json"
         claude_json.write_text('{"oauth": "token"}')
 
+        codex_dir = fake_home / ".codex"
+        codex_dir.mkdir(parents=True)
+        (codex_dir / "config.toml").write_text('model = "o3"\n')
+
         env_override = {
             "ACLI_MEMORY": "32G",
-            "ACLI_TOOLS": "copilot,vibe,antigravity,claude",
+            "ACLI_TOOLS": "copilot,vibe,antigravity,claude,codex",
             "ACLI_PERSISTENCE": "invalid_persistence_value",
             "ACLI_TOOLS_RO": "1",
             "ACLI_GIT_MODE": "",

@@ -30,6 +30,10 @@ if ! curl --version &> /dev/null ; then
     apt-get -y install build-essential
     apt-get install -y mingw-w64 binutils-mingw-w64 musl-tools
 fi
+if ! command -v ps &> /dev/null; then
+    apt-get update
+    apt-get -y install procps
+fi
 
 if ! volta --version &> /dev/null ; then
     curl https://get.volta.sh | bash
@@ -79,6 +83,11 @@ fi
 if ! claude --version &> /dev/null; then
     curl -fsSL https://claude.ai/install.sh | bash
     echo 'alias claude="IS_SANDBOX=1 claude --dangerously-skip-permissions"' >> "$HOME/.bashrc"
+fi
+
+if ! codex --version &> /dev/null; then
+    curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
+    echo 'alias codex="codex --dangerously-bypass-approvals-and-sandbox --no-daemon"' >> "$HOME/.bashrc"
 fi
 
 if ! udocker --version &> /dev/null ; then
@@ -1557,7 +1566,7 @@ def main():
     parser.add_argument("--mask-env", action=argparse.BooleanOptionalAction, default=None, help="Mask .env* files as empty 0-byte files")
     parser.add_argument("--tools-ro", action=argparse.BooleanOptionalAction, default=None, help="Mount tool root directories as read-only")
     parser.add_argument("--persistence", choices=["per-project", "global"], default=None, help="Tool state persistence mode (default: per-project)")
-    parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude)")
+    parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude, codex)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
     parser.add_argument("--userns", default=None, help="User namespace mode for Podman (e.g. keep-id:uid=0,gid=0, none)")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild the agcli-base image")
@@ -1594,7 +1603,7 @@ def main():
 
     # Resolution order: CLI Arguments > Environment Variables > Defaults
     acli_memory = args.memory or os.environ.get("ACLI_MEMORY", "16G")
-    acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity,claude")
+    acli_tools_str = args.tools or os.environ.get("ACLI_TOOLS", "copilot,vibe,antigravity,claude,codex")
 
     if args.persistence is not None:
         acli_persistence = args.persistence.strip().lower()
@@ -1735,9 +1744,16 @@ def main():
                         f_path = vibe_dir / f_name
                         if f_path.exists():
                             volumes.extend(["-v", f"{f_path}:{f_path}"])
-        elif t == "antigravity" and (home_path / ".gemini" / "antigravity-cli").is_dir():
+        elif t == "antigravity":
             ag_dir = home_path / ".gemini" / "antigravity-cli"
-            volumes.extend(["-v", f"{ag_dir}:{ag_dir}{ro_suffix}"])
+            ag_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if acli_tools_ro and acli_persistence == "per-project":
+                ag_storage = proj_storage_root / "antigravity-cli" / "config"
+                if not ag_storage.exists():
+                    copy_with_cow_rsync_fallback(ag_dir, ag_storage)
+                volumes.extend(["-v", f"{ag_storage}:{ag_dir}"])
+            else:
+                volumes.extend(["-v", f"{ag_dir}:{ag_dir}"])
             if acli_tools_ro:
                 for sub in ["brain", "conversations", "state", "sessions", "session", ".system_generated", "knowledge"]:
                     if acli_persistence == "per-project":
@@ -1746,10 +1762,6 @@ def main():
                         host_s_dir = ag_dir / sub
                     host_s_dir.mkdir(parents=True, exist_ok=True)
                     volumes.extend(["-v", f"{host_s_dir}:{ag_dir / sub}"])
-                for tmp_sub in ["log", "logs", "cache", "tmp", "bin", "crashes", "implicit", "scratch", "updater"]:
-                    s_dir = ag_dir / tmp_sub
-                    s_dir.mkdir(parents=True, exist_ok=True)
-                    volumes.extend(["--tmpfs", str(s_dir)])
                 for f_name in ["history.jsonl", "last_check.timestamp", "cli.log", "jetski_state.pbtxt"]:
                     if acli_persistence == "per-project":
                         host_f = proj_storage_root / "antigravity-cli" / f_name
@@ -1808,6 +1820,16 @@ def main():
                     volumes.extend(["-v", f"{claude_json}:{claude_json}"])
             volumes.extend(["-e", "DISABLE_AUTOUPDATER=1"])
             volumes.extend(["-e", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"])
+        elif t == "codex":
+            codex_dir = home_path / ".codex"
+            codex_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if acli_tools_ro and acli_persistence == "per-project":
+                codex_storage = proj_storage_root / "codex" / "config"
+                if not codex_storage.exists():
+                    copy_with_cow_rsync_fallback(codex_dir, codex_storage)
+                volumes.extend(["-v", f"{codex_storage}:{codex_dir}"])
+            else:
+                volumes.extend(["-v", f"{codex_dir}:{codex_dir}"])
 
     p_path = Path(project_dir)
 
