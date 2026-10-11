@@ -778,6 +778,55 @@ class TestMainFunction(unittest.TestCase):
         self.assertIn("--userns=keep-id:uid=1000,gid=1000", cmd)
 
     @patch("acli.subprocess.run")
+    def test_main_container_opts_cli_and_env(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="agcli-base latest\nheader line\n", returncode=0)
+        fake_home = self.p_path / "fake_home"
+        fake_home.mkdir()
+
+        def get_podman_run_cmd():
+            for call_args in mock_run.call_args_list:
+                args_list = call_args[0][0]
+                if len(args_list) >= 2 and args_list[0] == "podman" and args_list[1] == "run":
+                    return args_list
+            return None
+
+        # Case 1: value from environment variable
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch.dict(os.environ, {"ACLI_CONTAINER_OPTS": "--network host --ipc host"}):
+                with patch("sys.argv", ["acli", str(self.p_path)]):
+                    with patch("sys.exit") as mock_exit:
+                        main()
+                        mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        self.assertIn("--network", cmd)
+        self.assertIn("host", cmd)
+        self.assertIn("--ipc", cmd)
+
+        # Case 2: CLI value overrides environment variable
+        mock_run.reset_mock()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch.dict(os.environ, {"ACLI_CONTAINER_OPTS": "--network host"}):
+                with patch("sys.argv", ["acli", str(self.p_path), "--container-opts", "--ipc host"]):
+                    with patch("sys.exit") as mock_exit:
+                        main()
+                        mock_exit.assert_called_once_with(0)
+        cmd = get_podman_run_cmd()
+        self.assertIsNotNone(cmd)
+        self.assertIn("--ipc", cmd)
+        self.assertIn("host", cmd)
+        self.assertNotIn("--network", cmd)
+
+    @patch("acli.subprocess.run")
+    def test_main_invalid_container_opts_exits(self, mock_run):
+        mock_run.return_value = MagicMock(stdout="agcli-base latest\nheader line\n", returncode=0)
+        with patch("sys.argv", ["acli", str(self.p_path), "--container-opts", "\""]):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, 2)
+
+    @patch("acli.subprocess.run")
     def test_check_userns_supported(self, mock_run):
         # Stop global userns patcher to test the real implementation
         self.userns_patcher.stop()

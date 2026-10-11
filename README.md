@@ -82,6 +82,7 @@ The base dev environment container image (`agcli-base`) comes pre-installed with
 | `--persistence` | `ACLI_PERSISTENCE` | Session state and persistence storage scoping | `per-project` | `per-project`, `global` |
 | `--tools` | `ACLI_TOOLS` | Comma-separated agent CLI tool profiles to mount | `copilot,vibe,antigravity,claude,codex` | Any combination of `copilot`, `vibe`, `antigravity`, `claude`, `codex` |
 | `--memory` | `ACLI_MEMORY` | Container memory limit | `16G` | E.g., `4G`, `8G`, `16G`, `32G` |
+| `--container-opts` | `ACLI_CONTAINER_OPTS` | Additional raw options forwarded to `podman run` | *(empty)* | Any valid `podman run` options string (e.g. `-v /dev/fuse:/dev/fuse`) |
 
 ### Gitignore Modes
 
@@ -120,4 +121,9 @@ The `--gitignore-mode` option controls how files and directories matched by `.gi
 - **Running with specific tools & reduced memory:**
   ```bash
   uv run acli . --tools vibe,antigravity,claude,codex --memory 8G
+  ```
+
+- **Passing extra Podman runtime options:**
+  ```bash
+  uv run acli . --container-opts "-v /dev/fuse:/dev/fuse"
   ```

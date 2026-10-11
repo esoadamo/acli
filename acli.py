@@ -4,6 +4,7 @@ import fnmatch
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -49,11 +50,13 @@ fi
 if ! uv &> /dev/null ; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     . "$HOME/.local/bin/env"
-    uv python install
+    # Use a stable Python line that is currently compatible with the Rust/PyO3
+    # dependency chain used by several agent CLIs (e.g. mistral-vibe).
+    uv python install 3.14
 
     mkdir -p "$HOME/.local/bin"
-    ln -sf "$(uv python find)" "$HOME/.local/bin/python"
-    ln -sf "$(uv python find)" "$HOME/.local/bin/python3"
+    ln -sf "$(uv python find 3.14)" "$HOME/.local/bin/python"
+    ln -sf "$(uv python find 3.14)" "$HOME/.local/bin/python3"
 fi
 
 if ! agy --help &> /dev/null ; then
@@ -1569,6 +1572,7 @@ def main():
     parser.add_argument("--tools", default=None, help="Comma-separated tools to mount (copilot, vibe, antigravity, claude, codex)")
     parser.add_argument("--memory", default=None, help="Memory limit for container (default: 16G)")
     parser.add_argument("--userns", default=None, help="User namespace mode for Podman (e.g. keep-id:uid=0,gid=0, none)")
+    parser.add_argument("--container-opts", default=None, help="Additional options passed to 'podman run' (e.g. --container-opts '-v /dev/fuse:/dev/fuse')")
     parser.add_argument("--rebuild", action="store_true", help="Force rebuild the agcli-base image")
 
     args = parser.parse_args()
@@ -1660,6 +1664,17 @@ def main():
         acli_userns = os.environ.get("ACLI_USERNS", "auto").strip().lower()
         if not acli_userns:
             acli_userns = "auto"
+
+    if args.container_opts is not None:
+        container_opts_raw = args.container_opts
+    else:
+        container_opts_raw = os.environ.get("ACLI_CONTAINER_OPTS", "")
+
+    try:
+        extra_container_opts = shlex.split(container_opts_raw)
+    except ValueError as e:
+        print(f"E: invalid --container-opts/ACLI_CONTAINER_OPTS value: {e}", file=sys.stderr)
+        sys.exit(2)
 
     volumes = []
     home_path = Path.home()
@@ -1988,6 +2003,7 @@ def main():
         ["podman", "run", "-it", "--rm", "--name", container_name]
         + userns_opts
         + ["--cap-drop=ALL", "--security-opt=no-new-privileges"]
+        + extra_container_opts
         + filtered_volumes
         + filtered_project_mount
         + filtered_git_mounts
